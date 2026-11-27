@@ -1,0 +1,3212 @@
+---
+title: "FAO Employment Data Analysis"
+subtitle: "Supporting Gee, Pinello, Maudoux, Matthiasson, Polymeros. Counting work in global fisheries: sex-disaggregated employment, labour productivity and data gaps across aquatic food sectors."
+output:
+  html_document:
+    toc: yes
+    toc_float: yes
+    toc_collapsed: yes
+    number_sections: yes
+    code_folding: hide
+    df_print: paged
+bibliography: references.bib
+biblio-style: apsr
+reference-section-title: Bibliography
+toc-title: Table of contents
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(
+  echo = TRUE, 
+  results = 'show', 
+  message = FALSE,
+  warning = FALSE
+)
+
+# Uncomment the chunk below to export plots as image files for the paper
+# knitr::opts_chunk$set(
+#   fig.path = "images/generated-",
+#   dev = "pdf",       # Default format (png, jpg, pdf, etc.)
+#   # dpi = 300,         # Image resolution
+#   echo = FALSE       # Hide code from output
+# )
+
+# Parameters
+set.seed(20261109)  # may be necessary to ensure the reproducibility of results
+
+# Output folders for the figures and tables of the paper
+dir.create("./outputs/figures", showWarnings = FALSE, recursive = TRUE)
+dir.create("./outputs/tables", showWarnings = FALSE, recursive = TRUE)
+
+```
+
+```{css, echo=FALSE}
+/* Regression tables (made by stargazer, the only tables with this style): full page width and more space between columns */
+table[style="text-align:center"] { width: 100%; }
+table[style="text-align:center"] td { padding: 2px 10px; }
+```
+
+```{r functions}
+
+# More user-friendly y axes on plots
+
+addUnits <- function(n) {
+  labels <- ifelse(n < 1000, round(n, 1),  # less than thousands
+                   ifelse(n < 1e6, paste0(round(n/1e3, 1), 'k'),  # in thousands
+                          ifelse(n < 1e9, paste0(round(n/1e6, 1), 'M'),  # in millions
+                                 ifelse(n < 1e12, paste0(round(n/1e9, 1), 'M'), # in billions
+                                        ifelse(n < 1e15, paste0(round(n/1e12, 1), 'T'), # in trillions
+                                               'too big!'
+                                        )))))
+  return(labels)
+}
+
+# Custom theme to export plots for publication
+
+theme_journal <- function() {
+  theme_minimal(base_size = 8, base_family = "ArialMT") +
+    theme(
+      plot.title = element_blank(),       # remove titles for submission
+      plot.subtitle = element_blank(),
+      plot.caption = element_blank(),
+      # axis.text = element_text(size = 7),
+      # axis.title = element_text(size = 8),
+      # legend.text = element_text(size = 7),
+      # legend.title = element_text(size = 8),
+      # strip.text = element_text(size = 7),
+      panel.grid.minor = element_blank(),
+      legend.title = element_blank(),
+      legend.position = "bottom"
+    )
+}
+
+# Regression tables -------------------------------------------------------------------------------
+#
+# reg_table() prints one stargazer table for a list of lm/plm models, with:
+#   - coefficients with 95% confidence intervals in brackets (computed with the chosen standard errors)
+#   - significance stars from p-values computed with the same standard errors
+#   - N, number of countries, number of years (and range)
+#   - within, between and overall R² (Stata xtreg definitions, see model_stats())
+# The R² and adjusted R² reported by stargazer are dropped: for panel models they refer to the
+# transformed (demeaned or quasi-demeaned) data and are not comparable across model types.
+
+library(lmtest)   # coeftest()
+library(sandwich) # vcovCL() for lm models
+
+# Covariance matrix of the coefficients
+#   "conventional": the model's own (homoskedastic) covariance matrix
+#   "cluster": clustered by entity, i.e. by country since each model covers one sector
+#              (Arellano for plm models, CR1-type HC1 for lm models)
+model_vcov <- function(m, se_type = c("conventional", "cluster")) {
+  se_type <- match.arg(se_type)
+  if (se_type == "conventional") return(vcov(m))
+  if (inherits(m, "plm")) return(plm::vcovHC(m, method = "arellano", type = "HC1", cluster = "group"))
+  sandwich::vcovCL(m, cluster = model_panel(m)$entity, type = "HC1")
+}
+
+# Estimation sample of a model: dependent variable, linear prediction (xb), entity and year
+model_panel <- function(m) {
+  if (inherits(m, "plm")) {
+    idx <- plm::index(m)
+    year <- as.character(idx[[2]])
+    y <- as.numeric(plm::pmodel.response(m, model = "pooling"))
+    X <- model.matrix(m, model = "pooling")       # untransformed regressors (incl. year dummies in RE models)
+    b <- coef(m)
+    xb <- drop(X[, names(b), drop = FALSE] %*% b)
+    entity <- as.character(idx[[1]])
+    # Two-way FE: the year effects are absorbed, not estimated as coefficients. Recover them by regressing
+    # y - xb on country and year dummies (exact given the slopes) and add them to xb, which is equivalent
+    # to including year dummies, as in Stata's xtreg, fe with i.year
+    if (m$args$model == "within" && m$args$effect %in% c("time", "twoways")) {
+      aux <- lm(I(y - xb) ~ factor(entity) + factor(year))
+      lam <- coef(aux)[paste0("factor(year)", year)]
+      xb <- xb + ifelse(is.na(lam), 0, lam)              # reference year = 0
+    }
+    data.frame(y = y, xb = unname(xb), entity = entity, year = year)
+  } else {
+    # lm: the data are re-evaluated from the call; the model frame's row names give the rows used
+    d <- eval(m$call$data, envir = environment(formula(m)))
+    used <- d[as.integer(rownames(model.frame(m))), ]
+    data.frame(y = model.response(model.frame(m)), xb = unname(fitted(m)),
+               entity = used$entity, year = as.character(used$year))
+  }
+}
+
+# N, countries, years and within/between/overall R² of one model.
+#   within  = squared correlation of y and xb after subtracting each entity's mean
+#   between = squared correlation of the entity means of y and of xb
+#   overall = squared correlation of y and xb
+model_stats <- function(m) {
+  d <- model_panel(m)
+  dm <- function(v) v - ave(v, d$entity)
+  ybar <- tapply(d$y, d$entity, mean); xbbar <- tapply(d$xb, d$entity, mean)
+  yrs <- as.integer(d$year)
+  list(N         = nrow(d),
+       countries = dplyr::n_distinct(d$entity),
+       years     = paste0(dplyr::n_distinct(yrs), " (", min(yrs), "-", max(yrs), ")"),
+       r2_within  = cor(dm(d$y), dm(d$xb))^2,
+       r2_between = cor(ybar, xbbar)^2,
+       r2_overall = cor(d$y, d$xb)^2)
+}
+
+# Model type shown in the table
+model_type <- function(m) {
+  if (!inherits(m, "plm")) return("Pooled OLS")
+  switch(m$args$model, within = "Fixed effects", random = "Random effects", pooling = "Pooled OLS", m$args$model)
+}
+has_year_effects <- function(m) {
+  (inherits(m, "plm") && m$args$model == "within" && m$args$effect %in% c("time", "twoways")) ||
+    any(grepl("^factor\\(year\\)", names(coef(m))))
+}
+
+# Descriptive names of the covariates, used in all regression tables
+# (\u2013 is an en dash, written this way so that the file only contains plain ASCII characters)
+variable_labels <- c(
+  "share_female"           = "Share of female workers (0\u20131)",
+  "share_part_occ"         = "Share of part-time and occasional workers (0\u20131)",
+  "gdp"                    = "GDP per capita (thousand 2021 PPP dollars)",
+  "gni"                    = "GNI per capita (thousand 2021 PPP dollars)",
+  "log(gdp)"               = "Log GDP per capita",
+  "trade_openness"         = "Trade openness (% of GDP)",
+  "social_inequality"      = "Gini index (0\u2013100)",
+  "I(social_inequality^2)" = "Gini index, squared",
+  "gini_centred"           = "Gini index, centred on sample mean",
+  "I(gini_centred^2)"      = "Gini index, centred, squared"
+)
+
+# Replace variable names with their descriptive names (names not in the list are kept as they are)
+label_variables <- function(variables) {
+  ifelse(variables %in% names(variable_labels), variable_labels[variables], variables)
+}
+
+reg_table <- function(models, labels = c("Aquaculture", "Inland fishing", "Marine fishing"),
+                      se_type = c("conventional", "cluster"),
+                      dep.var.labels = "Log labour productivity (tonnes per worker)", ...) {
+  se_type <- match.arg(se_type)
+  # Covariates in the order stargazer shows them: order of first appearance across the models,
+  # without the year dummies (not shown) and the constant (shown last, as "Constant")
+  covariates <- unique(unlist(lapply(models, function(m) names(coef(m)))))
+  covariates <- covariates[!grepl("^factor\\(year\\)|^\\(Intercept\\)$", covariates)]
+  ct <- lapply(models, function(m) coeftest(m, vcov. = model_vcov(m, se_type)))
+  # 95% CI with the same t distribution and standard errors as coeftest()
+  ci <- lapply(seq_along(models), function(i) {
+    est <- ct[[i]][, 1]; se <- ct[[i]][, 2]; q <- qt(0.975, df = df.residual(models[[i]]))
+    cbind(est - q * se, est + q * se)
+  })
+  st <- lapply(models, model_stats)
+  r2 <- function(k) sprintf("%.3f", sapply(st, `[[`, k))
+  stargazer::stargazer(
+    models, type = "html",
+    p = lapply(ct, function(x) x[, 4]),
+    ci = TRUE, ci.custom = ci, ci.separator = ", ", ci.level = 0.95,
+    omit = "factor\\(year\\)",                         # year dummies of the RE models
+    omit.stat = c("n", "rsq", "adj.rsq", "ser", if (se_type == "cluster") "f"),  # N added below; F test is not robust
+    column.labels = labels, model.numbers = FALSE, dep.var.labels = dep.var.labels,
+    covariate.labels = label_variables(covariates),
+    add.lines = list(
+      c("Model", sapply(models, model_type)),
+      c("Year effects", ifelse(sapply(models, has_year_effects), "Yes", "No")),
+      c("Standard errors", rep(ifelse(se_type == "cluster", "Clustered by country", "Conventional"), length(models))),
+      c("Observations", format(sapply(st, `[[`, "N"), big.mark = ",")),
+      c("Countries", sapply(st, `[[`, "countries")),
+      c("Years", sapply(st, `[[`, "years")),
+      c("R<sup>2</sup> within", r2("r2_within")),
+      c("R<sup>2</sup> between", r2("r2_between")),
+      c("R<sup>2</sup> overall", r2("r2_overall"))),
+    # two separate notes: stargazer fails on a single note that mixes words and HTML entities
+    notes = c("<em>&#42;p&lt;0.1;&#42;&#42;p&lt;0.05;&#42;&#42;&#42;p&lt;0.01</em>",
+              "<em>95% confidence intervals in brackets</em>"),
+    notes.append = FALSE, ...)
+  invisible(st)
+}
+
+# export_reg_table() saves the content of a reg_table() table as a CSV file, with the same numbers:
+# for each covariate, one row with the coefficient and its stars and one row with the 95% confidence interval,
+# then the model type, year effects, standard errors, observations, countries, years and R².
+export_reg_table <- function(models, file, labels = c("Aquaculture", "Inland fishing", "Marine fishing"),
+                             se_type = c("conventional", "cluster")) {
+  se_type <- match.arg(se_type)
+  stars <- function(p) ifelse(p < 0.01, "***", ifelse(p < 0.05, "**", ifelse(p < 0.1, "*", "")))
+  # coefficients that round to 0.000 are shown with one more decimal, as stargazer does
+  fmt <- function(x) ifelse(round(x, 3) == 0 & x != 0, sprintf("%.4f", x), sprintf("%.3f", x))
+  # Same covariates and order as reg_table(); the constant (random-effects and OLS models) comes last
+  covariates <- unique(unlist(lapply(models, function(m) names(coef(m)))))
+  covariates <- covariates[!grepl("^factor\\(year\\)|^\\(Intercept\\)$", covariates)]
+  if (any(sapply(models, function(m) "(Intercept)" %in% names(coef(m))))) covariates <- c(covariates, "(Intercept)")
+  stat_names <- c("Model", "Year effects", "Standard errors", "Observations", "Countries", "Years",
+                  "R2 within", "R2 between", "R2 overall")
+  cells <- lapply(models, function(m) {
+    ct <- coeftest(m, vcov. = model_vcov(m, se_type))
+    q <- qt(0.975, df = df.residual(m))   # same t distribution as reg_table()
+    est <- sapply(covariates, function(v) if (v %in% rownames(ct)) paste0(fmt(ct[v, 1]), stars(ct[v, 4])) else "")
+    ci  <- sapply(covariates, function(v) if (v %in% rownames(ct))
+      sprintf("[%.3f, %.3f]", ct[v, 1] - q * ct[v, 2], ct[v, 1] + q * ct[v, 2]) else "")
+    st <- model_stats(m)
+    c(rbind(est, ci),
+      model_type(m), ifelse(has_year_effects(m), "Yes", "No"),
+      ifelse(se_type == "cluster", "Clustered by country", "Conventional"),
+      format(st$N, big.mark = ","), st$countries, st$years,
+      sprintf("%.3f", st$r2_within), sprintf("%.3f", st$r2_between), sprintf("%.3f", st$r2_overall))
+  })
+  covariate_labels <- ifelse(covariates == "(Intercept)", "Constant", label_variables(covariates))
+  out <- tibble::tibble(Variable  = c(rep(covariate_labels, each = 2), stat_names),
+                        Statistic = c(rep(c("Coefficient", "95% CI"), length(covariates)), rep("", length(stat_names))))
+  for (i in seq_along(models)) out[[labels[i]]] <- cells[[i]]
+  readr::write_csv(out, file)
+  invisible(out)
+}
+
+# Function to perform the Mundlak test
+
+mundlak_test <- function(fe_model) {
+  mf  <- fe_model$model
+  idx <- index(fe_model)
+  k   <- ncol(mf) - 1
+  x_names <- paste0("x", seq_len(k))
+  d <- data.frame(y = as.numeric(mf[[1]]), sapply(mf[-1], as.numeric),
+                  entity = idx[[1]], year = idx[[2]])
+  names(d)[2:(k + 1)] <- x_names
+  # Year dummies and their country means: needed for CRE = two-way FE in an unbalanced panel (Wooldridge 2019)
+  twoways  <- fe_model$args$effect == "twoways"
+  yr_names <- character(0)
+  if (twoways) {
+    Y <- model.matrix(~ factor(year), d)[, -1, drop = FALSE]
+    yr_names <- paste0("yr", seq_len(ncol(Y)))
+    colnames(Y) <- yr_names
+    d <- cbind(d, Y)
+  }
+  d <- d %>%
+    group_by(entity) %>%
+    mutate(across(all_of(c(x_names, yr_names)), mean, .names = "mean_{.col}")) %>%
+    ungroup() %>%
+    as.data.frame()
+  mean_x <- paste0("mean_", x_names)
+  cre <- lm(reformulate(c(x_names, yr_names, mean_x, paste0("mean_", yr_names)), response = "y"), data = d)
+  stopifnot(isTRUE(all.equal(unname(coef(cre)[x_names]), unname(coef(fe_model)), tolerance = 1e-6)))
+  b <- coef(cre)[mean_x]
+  wald <- function(V) {
+    W <- drop(t(b) %*% solve(V[mean_x, mean_x]) %*% b)
+    c(W, pchisq(W, df = k, lower.tail = FALSE))
+  }
+  w_classic <- wald(vcov(cre))
+  w_robust  <- wald(sandwich::vcovCL(cre, cluster = ~ entity, type = "HC1"))
+  tibble(`FE effects`           = ifelse(twoways, "entity + year", "entity"),
+         N                      = nrow(d),
+         Entities               = n_distinct(d$entity),
+         `Means tested`         = k,
+         `Chi2 (robust)`        = round(w_robust[1], 2),
+         `p-value (non-robust)` = signif(w_classic[2], 3),
+         `p-value (robust)`     = signif(w_robust[2], 3))
+}
+
+```
+
+# Data sources
+
+| Publisher | Dataset | URL | Date published | Version | Used for |
+|------------|------------|-------------|------------|------------|------------|
+| FAO | Employment in the Primary Sector of Fisheries and Aquaculture | <https://www.fao.org/fishery/collection/global_fishers/en> | 2026-09-03 | Release 2026.1.0 | Employment by sector, sex and time use; data flags; World Bank income group |
+| FAO | Global Production (FishStat) | <https://www.fao.org/fishery/collection/global_production/en> | 2026-03-30 | Release 2026.1.0 | Capture and aquaculture production |
+| FAO | Country code list ISO3 ↔ M49 | <https://github.com/openfigis/RefData/blob/gh-pages/country/CL_FI_COUNTRY_M49.csv> | 2026-03-31 | 2026 | Joining World Bank data to FAO data |
+| WB | GDP per capita, PPP (constant 2021 international \$) | <https://data.worldbank.org/indicator/NY.GDP.PCAP.PP.KD> | 2026-11-11 | WDI update of 11 Nov 2026 | Per capita income (continuous) |
+| WB | Trade (% of GDP) | <https://data.worldbank.org/indicator/NE.TRD.GNFS.ZS> | 2026-11-11 | WDI update of 11 Nov 2026 | Trade openness |
+| WB | Gini index | <https://data.worldbank.org/indicator/SI.POV.GINI> | 2026-11-11 | WDI update of 11 Nov 2026 | Social inequality |
+
+# Importing, cleaning and combining data
+
+## FAO employment data
+
+We import FAO's employment dataset (`emp_data`), which reports workers by country, work area, working time, sex and year. Work areas are grouped into three sectors: aquaculture, inland fishing and marine fishing (coastal, deep-sea and marine fishing not elsewhere included). Employment recorded under "sector unspecified" is kept for the descriptive figures but cannot be matched to production. For productivity, employment is summed over working time and sex, because production is not available at that level of detail. The release contains no fish processing employment.
+
+```{r emp}
+library(readr)
+library(janitor)
+library(dplyr)
+library(tidyr)
+
+# Employment data now comes directly from FAO's server
+
+temp <- tempfile()
+download.file("https://www.fao.org/fishery/static/Data/FI_Employment_2026.1.0.zip", temp)
+data <- read_csv(unz(temp, "EMPLOY_NUMBER.csv"), col_types = cols(.default = "c", PERIOD = "i", VALUE = "d")) %>%
+  clean_names() %>%
+  mutate(value = as.integer(value))
+stopifnot(!anyNA(data$value)) # Employment values are read as numbers rather than integers: 42 values written in scientific notation (for example 1e+05) would otherwise be lost. The import stops if any value is missing.
+countries <- read_csv(unz(temp, "CL_FI_COUNTRY_GROUPS.csv"), na = "") %>% # adding na = "" so that Namibia's ISO2 code isn't interpreted as a missing value
+  clean_names() %>%
+  select(un_code, name_en, continent_group_en, geo_region_group_en, eco_class_group_en)
+occupation <- read_csv(unz(temp, "CL_FI_OCCUPATION.csv"), col_types = cols(.default = "c")) %>%
+  clean_names() %>%
+  select(code, name_en)
+work_area <- read_csv(unz(temp, "CL_FI_WORK_AREA.csv")) %>%
+  clean_names() %>%
+  select(code, name_en)
+unlink(temp)
+
+# Join tables, restructure and export data
+
+emp_data <- data %>%
+  rename(sex = gender_code, year = period, flag = status) %>%
+  left_join(countries, by = c("country_un_code" = "un_code"), keep = FALSE) %>%
+  rename(un_code = country_un_code, geographic_area = name_en, continent = continent_group_en, region = geo_region_group_en, income_group_wb = eco_class_group_en) %>%
+  left_join(occupation, by = c("occupation_code" = "code"), keep = FALSE) %>%
+  rename(working_time = name_en) %>%
+  left_join(work_area, by = c("workarea_code" = "code"), keep = FALSE) %>%
+  rename(oc3 = name_en) %>%
+  mutate(oc2 = case_when(
+    workarea_code %in% c("C", "D", "M") ~ "Marine fishing",
+    workarea_code == "I" ~ "Inland fishing",
+    workarea_code == "A" ~ "Aquaculture",
+    workarea_code == "P" ~ "Processing",
+    workarea_code == "U" ~ "Unspecified"
+  )) %>%
+  mutate(income_group_wb = case_when(
+    income_group_wb == "Low-income countries" ~ "Low",
+    income_group_wb == "Lower-middle income countries" ~ "Lower-middle",
+    income_group_wb == "Upper-middle income countries" ~ "Upper-middle",
+    income_group_wb == "High-income countries" ~ "High",
+    income_group_wb == "Countries not classified by World Bank" ~ "Not classified"
+  )) %>%
+  mutate(continent_mod = case_when(
+  # continent == "Asia" & geographic_area %in% c("China", "Indonesia", "India") ~ geographic_area,
+  # continent == "Asia" & !(geographic_area %in% c("China", "Indonesia", "India")) ~ "Asia, excl. major producers",
+  continent == "Americas" & region == "Northern America" ~ "Northern America",
+  continent == "Americas" & region != "Northern America" ~ "LAC",
+   .default = continent)
+  ) %>%
+  select(geographic_area, un_code, continent, continent_mod, region, income_group_wb, oc2, oc3, working_time, sex, year, value, flag) %>%
+  filter(year <= 2023)
+
+emp_data
+
+emp_data_join <- emp_data %>%
+  filter(oc2 %in% c("Aquaculture", "Inland fishing", "Marine fishing")) %>%
+  group_by(un_code, geographic_area, continent, continent_mod, region, income_group_wb, oc2, year) %>%
+  summarise(value = sum(value, na.rm = TRUE)) %>%
+  ungroup() %>%
+  rename(value_emp = value) %>%
+  unite("conc_prod", c("un_code", "oc2", "year"), sep = "|", remove = FALSE) %>%
+  unite("conc_gdp", c("un_code", "year"), sep = "|", remove = FALSE)
+
+```
+
+The female share is F / (F + M) for each country, sector and year, after summing over working time. Workers of unspecified sex are excluded from both numerator and denominator; the share is missing when no worker has a recorded sex. A missing female record is treated as zero women, so "no women" and "women not reported" cannot be told apart.
+
+```{r emp_share_female}
+
+emp_share_female_join <- emp_data %>%
+  filter(oc2 %in% c("Aquaculture", "Inland fishing", "Marine fishing")) %>%
+  group_by(un_code, geographic_area, continent, continent_mod, region, income_group_wb, oc2, sex, year) %>%
+  summarise(value = sum(value, na.rm = TRUE)) %>%
+  ungroup() %>%
+  pivot_wider(names_from = sex, values_from = value, values_fill = 0) %>%
+  mutate(share_female = F/(M+F),
+         share_female = ifelse(is.nan(share_female), NA, share_female)) %>%
+  # unite("conc_gdp", c("un_code", "year"), sep = "|", remove = FALSE) %>%
+  unite("conc_prod", c("un_code", "oc2", "year"), sep = "|", remove = FALSE) %>%
+  select(conc_prod, U, F, M, share_female)
+
+emp_share_female_join
+
+```
+
+## FAO production data
+
+We import FAO capture and aquaculture production (`prod_data`) and aggregate it to the three employment sectors: freshwater, brackish-water and marine aquaculture form aquaculture, and capture is split into inland and marine fishing by FAO fishing area. Quantities reported in number of animals (mainly marine mammals and crocodiles) are dropped because they cannot be converted to tonnes. Thankfully, they only represent a very small fraction of the dataset. Aquatic plants are included.
+
+```{r prod}
+
+# Production data
+
+temp <- tempfile()
+download.file("https://www.fao.org/fishery/static/Data/GlobalProduction_2026.1.0.zip", temp)
+data <- read_csv(unz(temp, "Global_production_quantity.csv")) %>%
+  clean_names()
+countries <- read_csv(unz(temp, "CL_FI_COUNTRY_GROUPS.csv"), na = "") %>% # adding na = "" so that Namibia's ISO2 code isn't interpreted as a missing value
+  clean_names() %>%
+  select(un_code, name_en, continent_group_en, geo_region_group_en)
+# species <- read_csv(unz(temp, "CL_FI_SPECIES_GROUPS.csv")) %>%
+#   clean_names() %>%
+#   select(x3a_code, name_en, yearbook_group_en)
+water <- read_csv(unz(temp, "CL_FI_WATERAREA_GROUPS.csv")) %>%
+  clean_names() %>%
+  select(code, name_en, inland_marine_group_en)
+source <- read_csv(unz(temp, "CL_FI_PRODUCTION_SOURCE_DET.csv")) %>%
+  clean_names() %>%
+  select(code, name_en)
+unlink(temp)
+
+# Join tables, restructure and export data
+
+prod_raw <- data %>%
+  left_join(countries, by = c("country_un_code" = "un_code"), keep = FALSE) %>%
+  rename(un_code = country_un_code, country = name_en) %>%
+  # left_join(species, by = c("species_alpha_3_code" = "x3a_code"), keep = FALSE) %>%
+  # rename(`3alpha_code` = species_alpha_3_code, species_name = name_en) %>%
+  left_join(water, by = c("area_code" = "code"), keep = FALSE) %>%
+  rename(fishing_area_code = area_code, fishing_area_name = name_en) %>%
+  left_join(source, by = c("production_source_det_code" = "code"), keep = FALSE) %>%
+  rename(production_source_detailed_name = name_en)
+
+prod_data <- prod_raw %>%
+  mutate(oc2 = case_when(
+    production_source_detailed_name == "Aquaculture production (freshwater)" ~ "Aquaculture", 
+    production_source_detailed_name == "Aquaculture production (brackishwater)" ~ "Aquaculture", 
+    production_source_detailed_name == "Aquaculture production (marine)" ~ "Aquaculture",
+    production_source_detailed_name == "Capture production" & inland_marine_group_en == "Inland waters" ~ "Inland fishing",
+    production_source_detailed_name == "Capture production" & inland_marine_group_en == "Marine areas" ~ "Marine fishing")
+    ) %>%
+  mutate(measure = case_when(
+    measure == "Q_tlw" ~ "Tonnes - live weight", 
+    measure == "Q_no_1" ~ "Number")
+  ) %>%
+  rename(unit = measure,  year = period,  flag = status) %>%
+  filter(year >= 1995, unit != "Number") %>%
+  group_by(un_code, country, continent_group_en, geo_region_group_en, oc2, unit, year) %>%
+  summarise(value = sum(value, na.rm = TRUE)) %>%
+  ungroup()
+
+prod_data
+
+prod_data_join <- prod_data %>%
+  unite("conc_prod", c("un_code", "oc2", "year"), sep = "|") %>%
+  rename(value_prod = value) %>%
+  select(conc_prod, value_prod)
+
+```
+
+## WB GDP per capita data
+
+World Bank data use ISO3 codes to identify countries and FAO data use UN M49 codes; we join them with FAO's correspondence table. Entities that no longer exist and have no ISO3 code (for example Sudan [former] and Serbia and Montenegro [former]) receive no World Bank data.
+
+```{r iso-to-un}
+
+country_code_mapping <- read_csv("https://raw.githubusercontent.com/openfigis/RefData/refs/heads/gh-pages/country/CL_FI_COUNTRY_M49.csv") %>%
+  clean_names() %>%
+  select(iso3_code, un_code) %>%
+  filter(!is.na(iso3_code))
+
+country_code_mapping
+
+```
+
+For this project, we will be using the World Bank's "GDP per capita, PPP (constant 2021 international \$)" as the indicator of income level. GDP per capita has the advantage to be continuous variable, as opposed to using the income group categories. Using this indicator thus allows for performing a correlation analysis between two continuous variables. We call this dataset `income_data`.
+
+```{r gdp}
+
+library(stringr)
+
+income_data <- read_csv("./inputs/wb_gdp.csv") %>% # us "wb_gni.csv" for GNI, "wb_gdp.csv" for GDP
+  clean_names() %>%
+  pivot_longer(x1995:last_col(), names_to = "year", values_to = "value") %>%
+  mutate(year = as.integer(str_sub(year,-4,-1))) %>%
+  left_join(country_code_mapping, by = c("country_code" = "iso3_code")) %>%
+  filter(!is.na(un_code)) %>% # remove all countries/country groupings without an equivalent in the FAO data
+  select(country_name, un_code, year, value)
+
+# income_data <- WDI(indicator = "NY.GDP.PCAP.PP.KD", start = 1995, end = 2023) %>% # (use "NY.GNP.PCAP.PP.KD" for GNI, "NY.GDP.PCAP.PP.KD" for GDP)
+#   left_join(country_code_mapping, by = c("iso3c" = "iso3_code")) %>%
+#   filter(!is.na(un_code)) %>% # remove all countries/country groupings without an equivalent in the FAO data
+#   rename(value = `NY.GDP.PCAP.PP.KD`) %>%
+#   select(country, un_code, year, value)
+
+income_data
+
+income_data_join <- income_data %>%
+  unite("conc_gdp", c("un_code", "year"), sep = "|") %>%
+  rename(gdp = value) %>%
+  select(conc_gdp, gdp) %>% 
+  mutate(IQR = IQR(gdp, na.rm = TRUE), # identifying outliers here so that they can be joined with the productivity dataset
+         O_upper = quantile(gdp, probs=c( .75), na.rm = TRUE) + 1.5*IQR,  
+         O_lower = quantile(gdp, probs=c( .25), na.rm = TRUE) - 1.5*IQR
+         ) %>% 
+  mutate(outlier_gdp = gdp <= O_lower | gdp >= O_upper) %>%
+  select(-c(IQR, O_upper, O_lower))
+
+```
+
+## Generating the correlation dataset
+
+Let's create our dataset for the correlation analysis by joining the employment, production, income and share of female data. This allows us to calculate a productivity column from the employment and production variables. Country-years with zero production have no productivity (missing value), so they are excluded from all productivity analyses, as in the regressions.
+
+```{r join-productivity}
+
+correlation_data <- emp_data_join %>%
+  filter(value_emp != 0) %>% # removing entries where employment = 0 to avoid getting productivities with infinite values, making correlation calculation impossible
+  left_join(prod_data_join, by = "conc_prod") %>%
+  mutate(value_productivity = ifelse(value_prod > 0, value_prod / value_emp, NA)) %>% # zero production: productivity missing, as in the regressions
+  left_join(income_data_join,  by = "conc_gdp") %>%
+  left_join(emp_share_female_join, by = "conc_prod") %>%
+  select(-c(conc_prod, conc_gdp))
+
+correlation_data
+
+```
+
+# Exploratory data analysis
+
+Let's get more familiar with our employment data by exploring it visually. This can help us better understand how the data differ in different part of the world, how much of it is reported with a low level of specificity, how much had to be estimated, etc.
+
+## Visualizing the main variables of the employment dataset
+
+Here, we plot the employment data by its main variables and see how this varies by continent and country groups. This allows us to get a sense of one limitation of the employment dataset, namely the lack of specificity in the data reported by the member countries. As we see below, data can be classified as "Unspecified" in terms of sector, working time and sex.
+
+### By sector
+
+```{r eda-sector}
+
+library(ggplot2)
+
+theme_set(theme_minimal() + theme(legend.position = "bottom")) # Modified default plot theme
+
+p <- emp_data %>%
+  group_by(oc2, year) %>%
+  summarise(value = sum(value, na.rm = TRUE)) %>%
+  ungroup() %>%
+  ggplot(aes(x = year, y = value, color = oc2, linetype = oc2)) +
+    geom_line() +
+    # scale_fill_manual(values = c("Unspecified" = "grey")) +
+    labs(title = paste0("Global employment by sector, 1995-", max(emp_data$year)),
+         y = "Employment (people)",
+         x = "") +
+    scale_y_continuous(labels = addUnits) +
+    theme(legend.title = element_blank()) +
+    guides(color = guide_legend(nrow = 2, byrow = TRUE))
+
+p
+
+for (i in c(8, 12, 16)) {
+
+  ggsave(paste0("./outputs/figures/fig1_", i, "cm.pdf"), 
+         plot = p + theme_journal(), 
+         width = i, height = 0.75 * i, units = "cm")
+    
+}
+
+
+emp_data %>%
+  group_by(oc2, year) %>%
+  summarise(value = sum(value, na.rm = TRUE)) %>%
+  ungroup() %>%
+  pivot_wider(names_from = year, values_from = value) %>%
+  # rowwise() %>%
+  mutate(growth = (`2023`/`1995`-1) * 100)
+
+```
+
+```{r eda-sector-continent}
+
+p <- emp_data %>%
+  group_by(continent_mod, oc2, year) %>%
+  summarise(value = sum(value, na.rm = TRUE)) %>%
+  ungroup() %>%
+  ggplot(aes(x = year, y = value, fill = oc2)) +
+    geom_area() +
+    facet_wrap(~ continent_mod, scales = "free_y") +
+    # scale_fill_manual(values = c("Unspecified" = "grey")) +
+    labs(title = paste0("Employment by sector and continent, 1995-", max(emp_data$year)),
+         y = "Employment (people)",
+         x = "") +
+    scale_y_continuous(labels = addUnits) + 
+    theme(axis.text.x = element_text(angle = 45)) +
+  theme(legend.title = element_blank()) +
+  guides(fill = guide_legend(nrow = 2, byrow = TRUE))
+
+p
+
+for (i in c(8, 12, 16)) {
+
+  ggsave(paste0("./outputs/figures/figS1_", i, "cm.pdf"), 
+         plot = p + theme_journal() + theme(axis.text.x = element_text(angle = 45)), 
+         width = i, height = 0.75 * i, units = "cm")
+    
+}
+
+```
+
+### By working time
+
+```{r eda-time}
+
+emp_data %>%
+  group_by(working_time, year) %>%
+  summarise(value = sum(value, na.rm = TRUE)) %>%
+  ungroup() %>%
+  ggplot(aes(x = year, y = value, fill = working_time)) +
+    geom_area() +
+    labs(title = paste0("Global employment by time use, 1995-", max(emp_data$year)),
+         y = "Employment (people)",
+         x = "") +
+    scale_y_continuous(labels = addUnits) +
+    theme(legend.title = element_blank())
+
+```
+
+```{r eda-time-continent}
+
+p <- emp_data %>%
+  group_by(continent_mod, working_time, year) %>%
+  summarise(value = sum(value, na.rm = TRUE)) %>%
+  ungroup() %>%
+  ggplot(aes(x = year, y = value, fill = working_time)) +
+    geom_area(position = position_fill()) +
+    facet_wrap(~ continent_mod, scales = "free_y") +
+    labs(title = paste0("Employment by time use and continent, 1995-", max(emp_data$year)),
+         y = "Share of employment",
+         x = "") +
+    scale_y_continuous(labels = addUnits) + 
+    theme(axis.text.x = element_text(angle = 45)) +
+  theme(legend.title = element_blank()) +
+  guides(fill = guide_legend(nrow = 2, byrow = TRUE))
+
+p
+
+for (i in c(8, 12, 16)) {
+
+  ggsave(paste0("./outputs/figures/figS3_", i, "cm.pdf"), 
+         plot = p + theme_journal() + theme(axis.text.x = element_text(angle = 45)), 
+         width = i, height = 0.75 * i, units = "cm")
+    
+}
+
+```
+
+```{r eda-time-sector}
+
+emp_data %>%
+  group_by(oc2, working_time, year) %>%
+  summarise(value = sum(value, na.rm = TRUE)) %>%
+  ungroup() %>%
+  ggplot(aes(x = year, y = value, fill = working_time)) +
+    geom_area(position = position_fill()) +
+    facet_wrap(~ oc2, scales = "free_y") +
+    labs(title = paste0("Employment by time use and sector, 1995-", max(emp_data$year)),
+         y = "Share of employment",
+         x = "") +
+    scale_y_continuous(labels = addUnits) + 
+    theme(axis.text.x = element_text(angle = 45),
+          legend.title = element_blank())
+
+```
+
+```{r eda-time-sector-no-unspecified}
+
+emp_data %>%
+  group_by(oc2, working_time, year) %>%
+  summarise(value = sum(value, na.rm = TRUE)) %>%
+  ungroup() %>%
+  filter(working_time != "Status unspecified") %>%
+  ggplot(aes(x = year, y = value, fill = working_time)) +
+    geom_area(position = position_fill()) +
+    facet_wrap(~ oc2, scales = "free_y") +
+    labs(title = paste0("Employment by time use and sector, 1995-", max(emp_data$year)),
+         y = "Share of employment",
+         x = "",
+         caption = "The data excludes workers whose working time status is unspecified") +
+    scale_y_continuous(labels = addUnits) + 
+    theme(axis.text.x = element_text(angle = 45),
+          legend.title = element_blank())
+
+```
+
+```{r eda-sofia1}
+
+p <- emp_data %>%
+  filter(year == max(emp_data$year)) %>%
+  group_by(oc2, working_time) %>%
+  summarise(value = sum(value, na.rm = TRUE)) %>%
+  ungroup() %>%
+  ggplot(aes(x = oc2, y = value, fill = working_time)) +
+    geom_col(position = "stack") +
+    # scale_fill_manual(values = c("Status unspecified" = "grey")) +
+    labs(title = paste0("Employment by time use and sector, ", max(emp_data$year)),
+         y = "Employment (people)",
+         x = "") +
+    scale_y_continuous(labels = addUnits) +
+    theme(legend.title = element_blank(),
+          axis.text.x = element_text(angle = 45, hjust = 1)) +
+    guides(fill = guide_legend(nrow = 2, byrow = TRUE))
+
+p
+
+for (i in c(8, 12, 16)) {
+  
+  ggsave(paste0("./outputs/figures/fig2_", i, "cm.pdf"), 
+         plot = p + theme_journal() + theme(axis.title.y = element_text(size = 6)), 
+         width = i, height = 0.75 * i, units = "cm")
+    
+}
+
+```
+
+```{r eda-sofia2}
+
+my_order <- rev(c("Oceania", "Asia", "Africa", "Europe", "Americas"))
+
+emp_data %>%
+  filter(year == max(emp_data$year),
+         working_time != "Status unspecified") %>%
+  group_by(continent, working_time) %>%
+  summarise(value = sum(value, na.rm = TRUE)) %>%
+  ungroup() %>%
+  ggplot(aes(x = value, y = factor(continent, levels = my_order), fill = working_time)) +
+    geom_col(position = position_fill(reverse = TRUE)) +
+    # scale_fill_manual(values = c("Status unspecified" = "grey")) +
+    labs(title = paste0("Share of employment by time use and continent, ", max(emp_data$year)),
+         y = "",
+         x = "",
+         caption = "The data excludes workers whose working time status is unspecified") +
+    scale_x_continuous(labels = scales::percent) +
+  theme(legend.title = element_blank())
+
+```
+
+### By sex
+
+```{r eda-sofia2-sex}
+
+my_order <- rev(c("LAC", "Asia", "Oceania", "Africa", "Northern America", "Europe"))
+
+# Share of unspecified-sex workers in each region (out of all workers)
+u_share <- emp_data %>% 
+  filter(year == max(year)) %>%
+  group_by(continent_mod) %>%
+  summarise(u_prop = sum(value[sex == "U"], na.rm = TRUE) / sum(value, na.rm = TRUE)) %>%
+  ungroup()
+
+# Named vector: "Europe" -> "Europe (U: 40.5%)"
+region_labels <- setNames(
+  paste0(u_share$continent_mod, "\nU: ", scales::percent(u_share$u_prop, accuracy = 0.1)),
+  u_share$continent_mod
+)
+
+p <- emp_data %>% 
+  filter(year == max(year)) %>%
+  filter(sex != "U") %>%
+  group_by(continent_mod, sex) %>%
+  summarise(value = sum(value, na.rm = TRUE), .groups = "drop") %>%
+  ggplot(aes(x = value, y = factor(continent_mod, levels = my_order), fill = sex)) +
+  geom_col(position = position_fill(reverse = TRUE)) +
+  labs(title = paste0("Share of employment by sex and continent, ", max(emp_data$year)),
+       x = "", 
+       y = "",
+       caption = "The data excludes workers whose sex is undefined. The share of unspecified sex employment is discplayed below the continents' names.") +
+  scale_x_continuous(labels = scales::percent) +
+  scale_y_discrete(labels = region_labels) +
+  scale_fill_hue(labels = c("F" = "Female", "M" = "Male")) +
+  theme(legend.title = element_blank())
+
+p
+
+for (i in c(8, 12, 16)) {
+
+  ggsave(paste0("./outputs/figures/figS2_", i, "cm.pdf"), 
+         plot = p + theme_journal(), 
+         width = i, height = 0.75 * i, units = "cm")
+    
+}
+
+```
+
+```{r eda-sex}
+
+emp_data %>%
+  group_by(sex, year) %>%
+  summarise(value = sum(value, na.rm = TRUE)) %>%
+  ungroup() %>%
+  ggplot(aes(x = year, y = value, fill = sex)) +
+    geom_area() +
+    labs(title = paste0("Global employment by sex, 1995-", max(emp_data$year)),
+         y = "Employment (people)",
+         x = "") +
+    scale_y_continuous(labels = addUnits) +
+    theme(legend.title = element_blank())
+
+```
+
+```{r eda-sex-continent-rel}
+
+p <- emp_data %>%
+  group_by(continent_mod, sex, year) %>%
+  summarise(value = sum(value, na.rm = TRUE)) %>%
+  ungroup() %>%
+  ggplot(aes(x = year, y = value, fill = sex)) +
+    geom_area(position = position_fill()) +
+    facet_wrap(~ continent_mod, scales = "free_y") +
+    labs(title = paste0("Employment by sex and continent, 1995-", max(emp_data$year)),
+         y = "Share of employment",
+         x = "") +
+    scale_y_continuous(labels = addUnits) +
+    theme(axis.text.x = element_text(angle = 45)) +
+  theme(legend.title = element_blank())
+
+p
+
+for (i in c(8, 12, 16)) {
+
+  ggsave(paste0("./outputs/figures/figS4_", i, "cm.pdf"), 
+         plot = p + theme_journal() + theme(axis.text.x = element_text(angle = 45)), 
+         width = i, height = 0.75 * i, units = "cm")
+    
+}
+
+```
+
+```{r eda-sex-continent}
+
+p <- emp_data %>%
+  group_by(continent_mod, sex, year) %>%
+  summarise(value = sum(value, na.rm = TRUE)) %>%
+  ungroup() %>%
+  ggplot(aes(x = year, y = value, fill = sex)) +
+    geom_area() +
+    facet_wrap(~ continent_mod, scales = "free_y") +
+    labs(title = paste0("Employment by sex and continent, 1995-", max(emp_data$year)),
+         y = "Employment (people)",
+         x = "") +
+  scale_y_continuous(labels = addUnits) + 
+  theme(axis.text.x = element_text(angle = 45)) +
+  theme(legend.title = element_blank())
+
+p
+
+for (i in c(8, 12, 16)) {
+
+  ggsave(paste0("./outputs/figures/figS5_", i, "cm.pdf"), 
+         plot = p + theme_journal() + theme(axis.text.x = element_text(angle = 45)), 
+         width = i, height = 0.75 * i, units = "cm")
+    
+}
+
+```
+
+```{r eda-sex-sector}
+
+emp_data %>%
+  group_by(oc2, sex, year) %>%
+  summarise(value = sum(value, na.rm = TRUE)) %>%
+  ungroup() %>%
+  ggplot(aes(x = year, y = value, fill = sex)) +
+    geom_area(position = position_fill()) +
+    facet_wrap(~ oc2, scales = "free_y") +
+    labs(title = paste0("Employment by sex and sector, 1995-", max(emp_data$year)),
+         y = "Share of employment",
+         x = "") +
+    scale_y_continuous(labels = addUnits) + 
+    theme(axis.text.x = element_text(angle = 45),
+          legend.title = element_blank())
+
+```
+
+```{r eda-sex-sector-no-undefined}
+
+emp_data %>%
+  group_by(oc2, sex, year) %>%
+  summarise(value = sum(value, na.rm = TRUE)) %>%
+  ungroup() %>%
+  filter(sex != "U") %>%
+  ggplot(aes(x = year, y = value, fill = sex)) +
+    geom_area(position = position_fill()) +
+    facet_wrap(~ oc2, scales = "free_y") +
+    labs(title = paste0("Employment by sex and sector, 1995-", max(emp_data$year)),
+         y = "Share of employment",
+         x = "",
+         caption = "The data excludes workers whose sex is undefined") +
+    scale_y_continuous(labels = addUnits) + 
+    theme(axis.text.x = element_text(angle = 45),
+          legend.title = element_blank())
+
+```
+
+```{r region-sector-female-share}
+
+library(scales)
+
+p <- correlation_data %>%
+  filter(year == max(year)) %>%
+  group_by(continent_mod, oc2) %>%
+  summarise(U = sum(U), `F` = sum(`F`), M = sum(M)) %>%
+  rowwise() %>%
+  mutate(share_female = `F` / sum(M, `F`, na.rm = TRUE),
+         share_unspecified = `U` / sum(M, `F`, U, na.rm = TRUE),
+         conc = paste0(continent_mod, ", ", tolower(oc2), " (U: ", label_percent(accuracy = 0.1)(share_unspecified), ")")) %>%
+  filter(!is.na(share_female)) %>%
+  arrange(desc(share_female)) %>%
+  ungroup() %>%
+  ggplot(aes(x = share_female, y = reorder(conc, share_female))) +
+    geom_col(fill = "#619CFF") +
+    labs(title = paste0("Share of female employment by continent and sector, ", max(emp_data$year)),
+         x = "Share of female employment",
+         y = "",
+         caption = "The data excludes workers whose sex is undefined. The share of unspecified sex employment is discplayed below the continents' names.") +
+    scale_x_continuous(labels = label_percent())
+
+p
+
+for (i in c(8, 12, 16)) {
+
+  ggsave(paste0("./outputs/figures/fig4_", i, "cm.pdf"), 
+         plot = p + theme_journal() + theme(axis.title.x = element_text(size = 6)), 
+         width = i, height = 0.75 * i, units = "cm")
+    
+}
+
+```
+
+## Visualization of estimated data
+
+Displaying the data by flag allows us to highlight the part of the data that is estimated by FAO (and, for selected countries, jointly by the FAO and OECD). The estimated data is flagged with an "I". The complete list of flags is provided below:
+
+- "A" = Official figure.
+- "B" = Break in time series.
+- "E" = Estimate from the reporting country.
+- "K" = Data included in another category.
+- "M" = Missing value (data cannot exist, not applicable).
+- "P" = Provisional data.
+- "Q" = Confidential data.
+- "I" = FAO-OECD estimate.
+- "X" = Data reported by non-official or semi-official sources.
+
+### By sector
+
+```{r share_estimated_sector}
+
+emp_data %>%
+  group_by(oc2, flag, year) %>%
+  summarise(value = sum(value, na.rm = TRUE)) %>%
+  ungroup() %>%
+  pivot_wider(names_from = flag, values_from = value, values_fill = 0) %>%
+  mutate(share_estimated = I / rowSums(across(c(I, X, A, E, B, P, Q, L, M)), na.rm = TRUE)) %>%
+  ggplot(aes(x = year, y = share_estimated, linetype = oc2)) +
+    geom_line() +
+    facet_wrap(~ oc2) +
+    labs(title = paste0("Share of estimated employment by sector, 1995-", max(emp_data$year)),
+         y = "Share of estimated employment",
+         x = "") +
+    scale_y_continuous(labels = scales::percent) + 
+    theme(axis.text.x = element_text(angle = 45),
+          legend.title = element_blank())
+
+```
+
+The results on the chart above are highly influenced by the weight of major countries with big employment that isn't dragged too much. Redo chart using the number of observations instead of total employment.
+
+### By continent
+
+```{r eda-flag}
+
+emp_data %>%
+  group_by(flag, year) %>%
+  summarise(value = sum(value, na.rm = TRUE)) %>%
+  ungroup() %>%
+  ggplot(aes(x = year, y = value, fill = flag)) +
+    geom_area() +
+    labs(title = paste0("Global employment by flag, 1995-", max(emp_data$year)),
+         y = "Employment (people)",
+         x = "") +
+    scale_y_continuous(labels = addUnits) +
+    theme(legend.title = element_blank())
+
+```
+
+```{r eda-flag_continent}
+
+emp_data %>%
+  group_by(continent_mod, flag, year) %>%
+  summarise(value = sum(value, na.rm = TRUE)) %>%
+  ungroup() %>%
+  ggplot(aes(x = year, y = value, fill = flag)) +
+    geom_area() +
+    facet_wrap(~ continent_mod, scales = "free_y") +
+    labs(title = paste0("Employment by flag and continent, 1995-", max(emp_data$year)),
+         y = "Employment (people)") +
+    scale_y_continuous(labels = addUnits) +
+    theme(axis.text.x = element_text(angle = 45),
+          legend.title = element_blank())
+
+```
+
+## Visualization of unspecified sector data
+
+```{r unspecified-allocation, fig.dim = c(12, 12)}
+
+countries_unspecified <- emp_data %>%
+  filter(oc2 == "Unspecified") %>%
+  pull(geographic_area) %>%
+  unique()
+
+emp_data %>%
+  filter(geographic_area %in% countries_unspecified) %>%
+  mutate(alpha = ifelse(flag == "I", 0.35, 1)) %>%
+  group_by(geographic_area, oc2, alpha, year) %>%
+  summarise(value = sum(value, na.rm = TRUE)) %>%
+  ungroup() %>%
+  ggplot(aes(x = year, y = value, alpha = alpha, fill = oc2)) +
+    geom_bar(stat="identity") +
+    facet_wrap(~ geographic_area, scales = "free_y") +
+    # scale_fill_manual(values = c("Unspecified" = "grey")) +
+    labs(title = paste0("Employment by sector and geographic area, 1995-", max(emp_data$year)), 
+         subtitle = "Showing only countries with remaining unspecified sector employment",
+         x = "",
+         y = "Employment (people)",
+         caption = "Transparent bars show estimated data") +
+    scale_y_continuous(labels = addUnits) + 
+    scale_alpha_identity() +
+    theme(legend.title = element_blank())
+
+```
+
+## Visualization of unspecified sex and time use
+
+```{r unspecified-sex-timeuse, fig.dim = c(12, 12)}
+
+share_u_time <- emp_data %>%
+  group_by(continent_mod, year, working_time) %>%
+  summarise(value = sum(value, na.rm = TRUE)) %>%
+  pivot_wider(names_from = working_time, values_from = value) %>%
+  mutate(u_time = `Status unspecified`/sum(`Full time`, `Occasional`, `Part time`, `Status unspecified`, na.rm = TRUE),
+         conc = paste(continent_mod, year, sep = "|")) %>%
+  ungroup() %>%
+  select(conc, u_time)
+  
+share_u_sex <- emp_data %>%
+  group_by(continent_mod, year, sex) %>%
+  summarise(value = sum(value, na.rm = TRUE)) %>%
+  pivot_wider(names_from = sex, values_from = value) %>%
+  mutate(u_sex = U/sum(F, M, U, na.rm = TRUE),
+         conc = paste(continent_mod, year, sep = "|")) %>%
+  ungroup() %>%
+  select(conc, u_sex)
+
+p <- share_u_time %>%
+  left_join(share_u_sex) %>%
+  separate_wider_delim(conc, "|", names = c("continent_mod", "year")) %>%
+  mutate(year = as.integer(year)) %>%
+  pivot_longer(c("u_time", "u_sex"), names_to = "variable", values_to = "value") %>%
+  ggplot(aes(x = year, y = value, color = variable)) +
+    geom_line() +
+    facet_wrap(~ continent_mod, scales = "fixed") +
+    scale_color_hue(labels = c("u_sex" = "Unspecified sex", "u_time" = "Unspecified time use")) +
+    labs(title = paste0("Share of unknown sex and time use by region, 1995-", max(emp_data$year)),
+         x = "",
+         y = "Share of unknown sex and time use") +
+    scale_y_continuous(labels = scales::label_percent()) +
+    theme(axis.text.x = element_text(angle = 45),
+          legend.title = element_blank())
+
+p
+
+for (i in c(8, 12, 16)) {
+
+  ggsave(paste0("./outputs/figures/fig3_", i, "cm.pdf"), 
+         plot = p + theme_journal() + theme(axis.text.x = element_text(angle = 45), axis.title.y = element_text(size = 6)), 
+         width = i, height = 0.75 * i, units = "cm")
+    
+}
+
+```
+
+## Productivities by country groups
+
+### By continent
+
+We investigate the differences in the distribution of productivity data by continent below. Please note that the presence of outliers in the data inflate the mean value of productivity, while the median is robust to outliers.
+
+```{r productivities-continent, fig.dim = c(9, 12)}
+
+p <- correlation_data %>%
+    filter(year == max(correlation_data$year)) %>%
+    ggplot(aes(x = value_productivity, y = continent_mod)) +
+      geom_boxplot(outlier.shape = NA) +
+      geom_point(alpha = 0.3) +
+      stat_summary(fun = mean, geom = "point", shape = 20, size = 3, color = "red", alpha = 0.7) +
+      stat_summary(aes(x = stage(value_productivity, after_stat = Inf),
+                 label = round(after_stat(x), 1)),
+             fun = mean, geom = "text",
+             color = "red", alpha = 0.7, size = 3, hjust = 1.1) +
+      facet_wrap(vars(oc2), ncol = 1, scales = "free_x",
+                 labeller = as_labeller(function(x) paste0(letters[seq_along(x)], ") ", x))) +
+      scale_y_discrete(limits = rev) +
+      labs(title = paste("Distribution of productivity by continent,", max(correlation_data$year)), 
+           subtitle = paste0("Mean productivity indicated in red."),
+           x = "Productivity (tonnes/worker/year)",
+           y = "") +
+      theme(strip.text = element_text(hjust = 0))
+
+p
+
+for (i in c(12, 16)) {
+
+  ggsave(paste0("./outputs/figures/fig6_", i , "cm.pdf"), 
+         plot = p + theme_journal() + theme(strip.text = element_text(hjust = 0), axis.title.x = element_text(size = 6)),
+         width = 0.75 * i, height = i, units = "cm")
+  
+}
+
+```
+
+```{r productivities-continent-line, fig.dim = c(9, 12)}
+
+correlation_data %>%
+    filter(value_prod > 0) %>% # zero production excluded, as in all productivity analyses
+    group_by(continent_mod, oc2, year) %>%
+    summarise(value_emp = sum(value_emp, na.rm = TRUE),
+              value_prod = sum(value_prod, na.rm = TRUE)) %>%
+    ungroup() %>%
+    mutate(value_productivity = value_prod / value_emp) %>%
+    ggplot(aes(x = year, y = value_productivity, color = continent_mod)) +
+      geom_line() +
+      facet_wrap(vars(oc2), ncol = 1, scales = "free_y",
+                 labeller = as_labeller(function(x) paste0(letters[seq_along(x)], ") ", x))) +
+      labs(title = "Aggregate productivity by continent and sector",
+           x = "",
+           y = "Aggregate productivity (total tonnes/total workers)") +
+      theme(strip.text = element_text(hjust = 0),
+            legend.title= element_blank())
+
+
+```
+
+```{r productivities-sector-line}
+ 
+correlation_data %>%
+  filter(value_prod > 0) %>% # zero production excluded, as in all productivity analyses
+  group_by(oc2, year) %>%
+  summarise(value_emp = sum(value_emp, na.rm = TRUE),
+            value_prod = sum(value_prod, na.rm = TRUE)) %>%
+  ungroup() %>%
+  mutate(value_productivity = value_prod / value_emp) %>%
+  ggplot(aes(x = year, y = value_productivity, color = oc2, linetype = oc2)) +
+    geom_line() +
+    labs(title = "Aggregate productivity by sector",
+         x = "",
+         y = "Aggregate productivity (total tonnes/total workers)") +
+    theme(legend.title = element_blank())
+
+```
+
+```{r productivities-sector-continent-line}
+ 
+correlation_data %>%
+  filter(value_prod > 0) %>% # zero production excluded, as in all productivity analyses
+  group_by(continent_mod, oc2, year) %>%
+  summarise(value_emp = sum(value_emp, na.rm = TRUE),
+            value_prod = sum(value_prod, na.rm = TRUE)) %>%
+  ungroup() %>%
+  mutate(value_productivity = value_prod / value_emp) %>%
+  ggplot(aes(x = year, y = value_productivity, color = oc2, linetype = oc2)) +
+    geom_line() +
+    facet_wrap(~ continent_mod, scales = "free_y") +
+    labs(title = "Aggregate productivity by sector and continent",
+         x = "",
+         y = "Aggregate productivity (total tonnes/total workers)") +
+    theme(axis.text.x = element_text(angle = 45),
+          legend.title = element_blank())
+
+```
+
+### By income group
+
+We do the same as above, this time by income group.
+
+```{r productivities-income, fig.dim = c(9, 12)}
+
+p <- correlation_data %>%
+    filter(year == max(correlation_data$year)) %>%
+    ggplot(aes(x = value_productivity, y = factor(income_group_wb, level = c("Not classified", "Low", "Lower-middle", "Upper-middle", "High")))) +
+      geom_boxplot(outlier.shape = NA) +
+      geom_point(alpha = 0.3) +
+      stat_summary(fun = mean, geom = "point", shape = 20, size = 3, color = "red", alpha = 0.7) +
+      stat_summary(aes(x = stage(value_productivity, after_stat = Inf),
+                 label = round(after_stat(x), 1)),
+             fun = mean, geom = "text",
+             color = "red", alpha = 0.7, size = 3, hjust = 1.1) +
+      facet_wrap(vars(oc2), ncol = 1, scales = "free_x",
+             labeller = as_labeller(function(x) paste0(letters[seq_along(x)], ") ", x))) +
+      labs(title = paste("Distribution of productivity by income group,", max(correlation_data$year)), 
+           subtitle = paste0("Mean productivity indicated in red."),
+           x = "Productivity (tonnes/worker/year)",
+           y = "")  +
+      theme(strip.text = element_text(hjust = 0))
+
+p
+
+for (i in c(12, 16)) {
+
+  ggsave(paste0("./outputs/figures/fig5_", i , "cm.pdf"), 
+         plot = p + theme_journal() + theme(strip.text = element_text(hjust = 0), axis.title.x = element_text(size = 6)),
+         width = 0.75 * i, height = i, units = "cm")
+  
+}
+
+```
+
+## Productivity - sensitivity analysis
+
+```{r productivity-sensitivity}
+
+# Determining which country/sector combinations have only specified time-use
+
+specified_wt <- emp_data %>%
+  group_by(geographic_area, oc2, working_time) %>%
+  summarise(value = sum(value, na.rm = TRUE)) %>%
+  pivot_wider(names_from = working_time, values_from = value) %>%
+  mutate(unspecified = !is.na(`Status unspecified`),
+         conc = paste(geographic_area, oc2, sep = "|")) %>%
+  filter(!unspecified) %>%
+  pull(conc)
+
+emp_data_weighted <- emp_data %>%
+  mutate(value_weighted = case_when(
+    working_time == "Full time" ~ value * 0.95,
+    working_time == "Part time" ~ value * 0.60,
+    working_time == "Occasional" ~ value * 0.15,
+    working_time == "Status unspecified" ~ NA
+  ))
+
+emp_data_weighted_join <- emp_data_weighted %>%
+  filter(oc2 %in% c("Aquaculture", "Inland fishing", "Marine fishing")) %>%
+  group_by(un_code, geographic_area, continent, continent_mod, region, income_group_wb, oc2, year) %>%
+  summarise(value_emp = sum(value, na.rm = TRUE), value_emp_weighted = sum(value_weighted, na.rm = TRUE)) %>%
+  ungroup() %>%
+  unite("conc_prod", c("un_code", "oc2", "year"), sep = "|", remove = FALSE) %>%
+  unite("conc_gdp", c("un_code", "year"), sep = "|", remove = FALSE)
+
+# join with prod
+
+correlation_data_weighted <- emp_data_weighted_join %>%
+  filter(value_emp != 0) %>% # removing entries where employment = 0 to avoid getting productivities with infinite values, making correlation calculation impossible
+  left_join(prod_data_join, by = "conc_prod") %>%
+  select(-c(conc_prod, conc_gdp)) %>%
+  mutate(conc = paste(geographic_area, oc2, sep = "|")) %>%
+  filter(conc %in% specified_wt)
+
+```
+
+### Productivities comparison: regular vs weighted
+
+Weighting workers by working time (full-time 0.95, part-time 0.60, occasional 0.15, based on the definitions from the [CWP](https://www.fao.org/cwp-on-fishery-statistics/handbook/capture-fisheries-statistics/fishers/en/)) raises productivity by 6% in aquaculture, 13% in marine fishing and 32% in inland fishing, where part-time and occasional work is most common. The comparison is limited to country-sectors with no unspecified working time, which account for only 20–30% of 2023 employment.
+
+```{r productivity-sensitivity-sector, fig.dim = c(9, 12)}
+
+correlation_data_weighted_oc2 <- correlation_data_weighted %>%
+  filter(value_prod > 0) %>% # zero production excluded, as in all productivity analyses
+  group_by(year, oc2) %>%
+  summarise(value_emp = sum(value_emp, na.rm = TRUE),
+            value_emp_weighted = sum(value_emp_weighted, na.rm = TRUE),
+            value_prod = sum(value_prod, na.rm = TRUE)) %>%
+  ungroup() %>%
+  mutate(value_productivity_regular = value_prod / value_emp, # calculate the two types of productivities
+         value_productivity_weighted = value_prod / value_emp_weighted) %>%
+  pivot_longer(c(value_productivity_regular, value_productivity_weighted), names_to = "productivity_type", values_to = "value_productivity")
+
+avg_difference <- correlation_data_weighted_oc2 %>% 
+    pivot_wider(names_from = productivity_type, values_from = value_productivity) %>%
+    mutate(difference = value_productivity_weighted/value_productivity_regular-1) %>%
+    group_by(oc2) %>%
+    summarise(avg_difference = mean(difference))
+
+# chart productivities for both the world and each sector/continent
+
+# Named vector: names = sector, values = avg_difference
+diff_lookup <- setNames(avg_difference$avg_difference, avg_difference$oc2)
+
+correlation_data_weighted_oc2 %>%
+  ggplot(aes(x = year, y = value_productivity, color = productivity_type)) +
+  geom_line() +
+  facet_wrap(vars(oc2), ncol = 1, scales = "free_y",
+             labeller = as_labeller(function(x) {
+               paste0(letters[seq_along(x)], ") ", x,
+                      " (avg. difference: ", sprintf("%.1f%%", diff_lookup[x]*100), ")")
+             })) +
+  labs(title = "Aggregate productivity by sector",
+       subtitle = "Regular vs. weighted",
+       x = "",
+       y = "Aggregate productivity (total tonnes/total workers)",
+       caption = "Only includes country/sector combinations with no unspecified working time employment.") +
+  theme(strip.text = element_text(hjust = 0),
+        legend.title = element_blank())
+
+```
+
+## Female shares by country groups
+
+### By continent
+
+We investigate the differences in the distribution of female share of employment data by continent below.
+
+```{r shares-female-continent, fig.dim = c(9, 12)}
+
+correlation_data %>%
+    filter(year == max(correlation_data$year)) %>%
+    ggplot(aes(x = share_female, y = continent_mod)) +
+      geom_boxplot(outlier.shape = NA) +
+      geom_point(alpha = 0.3) +
+      stat_summary(fun = mean, geom = "point", shape = 20, size = 3, color = "red", alpha = 0.7) +
+      stat_summary(aes(x = stage(share_female, after_stat = Inf),
+                 label = round(after_stat(x), 2)),
+             fun = mean, geom = "text",
+             color = "red", alpha = 0.7, size = 3, hjust = 1.1) +
+      facet_wrap(vars(oc2), ncol = 1, scales = "free_x",
+                 labeller = as_labeller(function(x) paste0(letters[seq_along(x)], ") ", x))) +
+      scale_y_discrete(limits = rev) +
+      labs(title = paste("Distribution of female share of employment by continent,", max(correlation_data$year)), 
+           subtitle = "Mean share of female employment indicated in red.",
+           x = "Share of female employment",
+           y = "") +
+      theme(strip.text = element_text(hjust = 0))
+
+```
+
+```{r shares-female-continent-line, fig.dim = c(9, 12)}
+
+correlation_data %>%
+    group_by(continent_mod, oc2, year) %>%
+    summarise(mean_female_share = mean(share_female, na.rm = TRUE)) %>%
+    ggplot(aes(x = year, y = mean_female_share, color = continent_mod)) +
+      geom_line() +
+      facet_wrap(vars(oc2), ncol = 1, scales = "free_y",
+                     labeller = as_labeller(function(x) paste0(letters[seq_along(x)], ") ", x))) +
+      labs(title = "Mean female share of employment by continent", 
+           x = "",
+           y = "Share of female employment") +
+      theme(strip.text = element_text(hjust = 0),
+            legend.title = element_blank())
+
+```
+
+### By income group
+
+We do the same as above, this time by income group.
+
+```{r shares-female-income, fig.dim = c(9, 12)}
+
+correlation_data %>%
+    filter(year == max(correlation_data$year)) %>%
+    ggplot(aes(x = share_female, y = factor(income_group_wb, level = c("Not classified", "Low", "Lower-middle", "Upper-middle", "High")))) +
+      geom_boxplot(outlier.shape = NA) +
+      geom_point(alpha = 0.3) +
+      stat_summary(fun = mean, geom = "point", shape = 20, size = 3, color = "red", alpha = 0.7) +
+      stat_summary(aes(x = stage(share_female, after_stat = Inf),
+                 label = round(after_stat(x), 2)),
+             fun = mean, geom = "text",
+             color = "red", alpha = 0.7, size = 3, hjust = 1.1) +
+      facet_wrap(vars(oc2), ncol = 1, scales = "free_x",
+                 labeller = as_labeller(function(x) paste0(letters[seq_along(x)], ") ", x))) +
+      labs(title = paste("Distribution of female share of employment by income group,", max(correlation_data$year)), 
+           subtitle = "Mean share of female employment indicated in red.",
+           x = "Share of female employment",
+           y = "Income group") +
+      theme(strip.text = element_text(hjust = 0))
+
+```
+
+### Output per worker by region and income group, 2023 (Table S3)
+
+The table summarises output per worker in the latest year, by sector and by region or income group. For each group it gives the number of countries, the median, the interquartile range (first to third quartile) and the mean of the country values, all unweighted, and the aggregate output per worker (total production divided by total employment). The rule for zeros is the same as in the rest of the analysis (chunk `join-productivity`): countries that report employment but no production, or production of zero, have no productivity and are left out. The table is saved as `tableS3.csv` (Table S3 of the Supplement, panels A and B).
+
+```{r productivity-table}
+
+# Output per worker by sector and group (region or income group) in the latest year, unweighted across countries,
+# plus the aggregate (total tonnes / total workers) of the same countries
+productivity_summary <- function(data, group_var, grouping) {
+  data %>%
+    filter(!is.na(value_productivity)) %>%  # zero production or no production record: no productivity
+    group_by(Sector = oc2, Group = .data[[group_var]]) %>%
+    summarise(Countries = n(),
+              Median = round(median(value_productivity), 1),
+              Q1 = quantile(value_productivity, 0.25),
+              Q3 = quantile(value_productivity, 0.75),
+              Mean = round(mean(value_productivity), 1),
+              Aggregate = round(sum(value_prod) / sum(value_emp), 1)) %>%
+    ungroup() %>%
+    mutate(`Interquartile range` = sprintf("%.1f\u2013%.1f", Q1, Q3), .after = Median) %>%  # \u2013: en dash
+    select(-Q1, -Q3) %>%
+    mutate(Grouping = grouping, .before = 1)
+}
+
+productivity_data_latest <- correlation_data %>%
+  filter(year == max(correlation_data$year)) %>%
+  mutate(continent_mod = if_else(continent_mod == "LAC", "Latin America and the Caribbean", continent_mod),
+         income_group_wb = factor(income_group_wb,
+                                  levels = c("Low", "Lower-middle", "Upper-middle", "High", "Not classified"),
+                                  labels = c("Low-income", "Lower-middle income", "Upper-middle income",
+                                             "High-income", "Not classified")))
+
+productivity_region <- productivity_summary(productivity_data_latest, "continent_mod", "Region")
+productivity_income <- productivity_summary(productivity_data_latest, "income_group_wb", "Income group")
+
+productivity_region
+productivity_income
+
+write_csv(bind_rows(productivity_region, productivity_income %>% mutate(Group = as.character(Group))),
+          "./outputs/tables/tableS3.csv")
+
+```
+
+# Correlation analysis
+
+## Correlation: productivity vs income
+
+Let's continue our analysis by investigating correlations between important variables in our data. We start with the potential correlation between labor productivity and income (as measured by GDP per capita).
+
+### Choice of correlation coefficient
+
+#### Data distributions
+
+An important aspect of data to investigate when calculating correlations is to determine whether the variables used in the study are normally distributed. Indeed, the commonly used Pearson correlation coefficient relies on the assumptions that both variables follow a normal distribution [@schober2018correlation].
+
+##### Productivity data
+
+If we plot the distribution of productivities for each sector, we clearly see that this variable fails to display normality.
+
+```{r productivities-hist}
+
+correlation_data %>%
+  ggplot(aes(x = value_productivity)) +
+    geom_histogram() +
+    facet_wrap(~oc2, scales = "free")
+
+```
+
+For more details, we print summary statistics for each sector below.
+
+```{r productivities-summary}
+
+tapply(correlation_data$value_productivity, correlation_data$oc2, summary)
+
+```
+
+##### GDP per capita data
+
+Let's now plot the distribution of the GDP per capita values. As you can see, the data appears to also be non-normally distributed. As we mentioned above, this has important implications for choosing the appropriate type of correlation coefficient in our analysis.
+
+```{r gdp-hist}
+
+income_data %>%
+  ggplot(aes(x = value)) +
+    geom_histogram() +
+    scale_x_continuous(labels = addUnits)
+
+```
+
+Summary statistics for the GDP per capita data are printed below.
+
+```{r gdp-summary}
+
+summary(income_data$value)
+
+```
+
+#### Outliers detection
+
+Another important aspect to investigate is the potential presence of outliers in the data, which can bias measures of correlation [@witte2017statistics]. In this section, we use boxplots to visualize outliers, which are represented as black dots on the charts below. Here, we use the common definition of outliers as the values falling outside of the range [Q1 - 1.5 \* IQR, Q3 + 1.5 \* IQR], where Q1 and Q3 respectively denote the first and third quartiles and IQR refers to the interquartile range.
+
+##### Productivity data
+
+Visualizing the distributions of the productivity variable as a boxplot for each sector reveals the presence of many outliers in the data.
+
+```{r productivities-boxplot}
+
+correlation_data %>% 
+  ggplot(aes(y = value_productivity)) +
+  geom_boxplot() +
+  facet_wrap(~oc2, scales = "free") +
+  theme(axis.text.x=element_blank(),
+        axis.ticks.x=element_blank())
+
+```
+
+We identify these outliers in the dataset for later use. Below, we also print the share of outliers in the data for each sector.
+
+```{r productivity-outliers}
+
+correlation_data <- correlation_data %>%
+  group_by(oc2) %>%
+  mutate(IQR = IQR(value_productivity, na.rm = TRUE),
+         O_upper = quantile(value_productivity, probs=c( .75), na.rm = TRUE) + 1.5*IQR,  
+         O_lower = quantile(value_productivity, probs=c( .25), na.rm = TRUE) - 1.5*IQR
+         ) %>% 
+  mutate(outlier_productivity = value_productivity <= O_lower | value_productivity >= O_upper) %>%
+  ungroup() %>%
+  select(-c(IQR, O_upper, O_lower)) %>%
+  mutate(outlier_either = outlier_gdp | outlier_productivity)
+
+correlation_data %>%
+  filter(!is.na(value_productivity)) %>%
+  group_by(oc2) %>%
+  summarise(sum(outlier_productivity), n(), sum(outlier_productivity)/n()) %>%
+  ungroup()
+
+```
+
+##### GDP per capita data
+
+Generating a boxplot with the GDP per capita values shows that many outliers are also present in this dataset.
+
+```{r gdp-boxplot}
+
+income_data %>% 
+  ggplot(aes(x = "", y = value)) +
+  geom_boxplot() +
+  scale_y_continuous(labels = addUnits)
+
+```
+
+We identify these outliers in the dataset for later use. Below, we also print the share of outliers in the data.
+
+```{r gdp-outliers}
+
+income_data_join %>%
+  filter(!is.na(gdp)) %>%
+  summarise(sum(outlier_gdp), n(), sum(outlier_gdp)/n())
+
+```
+
+#### Conclusion
+
+Since both variables of interest for our correlation test are non-normal, using Spearman's rank correlation coefficient is more appropriate than using the more commonly used Pearson coefficient. Moreover, Spearman's rank correlation coefficient is also robust to outliers [@schober2018correlation], which reinforces our confidence in the choice of this type of correlation coefficient.
+
+### Calculation and visualization of correlations
+
+The charts below feature a scatterplot visualization of the relationship between productivity and GDP per capita for each employment sector, and include the value of the Spearman correlation coefficient in each case. Observations classified as outliers for either dataset are colored in orange.
+
+```{r corr-productivities, fig.dim = c(9, 12)}
+
+library(gridExtra )
+library(magrittr) # for special pipes (%$%)
+
+plot_list <- list() 
+
+for (i in c("Aquaculture", "Inland fishing", "Marine fishing")) {
+ 
+  outliers_prc <- correlation_data %>%
+    filter(oc2 == i) %>%
+    filter(!is.na(outlier_either)) %>%
+    summarise(sum(outlier_either)/n()) %>%
+    pull() %>%
+    round(2)
+  
+  corr_coef <- correlation_data %>%
+    filter(oc2 == i) %$%
+    cor(value_productivity, gdp, method = "spearman", use = "complete.obs") %>%
+    round(2)
+  
+  plot_list[[i]] <- correlation_data %>%
+    filter(oc2 == i) %>%
+    ggplot(aes(x = gdp, y = value_productivity, color = outlier_either)) +
+      geom_point(alpha = 0.3) +
+      # geom_smooth(method = 'lm', formula = y ~ x, se = FALSE) +
+      scale_color_manual(values = c("TRUE" = "coral"),guide = "none") +
+      labs(title = i, 
+           subtitle = paste0("Spearman correlation coefficient: ", corr_coef, ". Outliers shown in orange."), 
+           caption = paste0("Proportion of outliers: ", outliers_prc),
+           x = "GDP (USD/capita/year)", 
+           y = "Productivity (tonnes/worker/year)") +
+      scale_x_continuous(labels = addUnits)
+   
+}
+
+grid.arrange(grobs = plot_list, ncol = 1)
+
+```
+
+Since the Spearman correlation coefficient is (to a degree) robust to outliers, we can plot the charts above without the outliers we've identified, so that we can focus on the data that has the most weight on the results. It is worth stating again that a large majority of observations are contained in these subsets of the data.
+
+```{r corr-robust, fig.dim = c(9, 12)}
+
+plot_list <- list() 
+
+for (i in c("Aquaculture", "Inland fishing", "Marine fishing")) {
+ 
+  outliers_prc <- correlation_data %>%
+    filter(oc2 == i) %>%
+    filter(!is.na(outlier_either)) %>%
+    summarise(sum(outlier_either)/n()) %>%
+    pull() %>%
+    round(2)
+  
+  corr_coef <- correlation_data %>%
+    filter(oc2 == i) %$%
+    cor(value_productivity, gdp, method = "spearman", use = "complete.obs") %>%
+    round(2)
+  
+  plot_list[[i]] <- correlation_data %>%
+    filter(oc2 == i, !outlier_either) %>%
+    ggplot(aes(x = gdp, y = value_productivity)) +
+      geom_point(alpha = 0.3) +
+      # geom_smooth(method = 'lm', formula = y ~ x, se = FALSE) +
+      labs(title = i, 
+           subtitle = paste0("Spearman correlation coefficient: ", corr_coef, ". Outliers not shown."), 
+           caption = paste0("Proportion of outliers: ", outliers_prc),
+           x = "GDP (USD/capita/year)", 
+           y = "Productivity (tonnes/worker/year)") +
+      scale_x_continuous(labels = addUnits)
+   
+}
+
+grid.arrange(grobs = plot_list, ncol = 1)
+
+```
+
+## Correlation: share of female employment vs income
+
+### Choice of correlation coefficient
+
+#### Data distributions
+
+If we plot the distribution of shares of female employment for each sector, we see that this variable also fails to display normality. However, values are less concentrated around zero, compared to the productivity or income data.
+
+```{r share-female-hist}
+
+correlation_data %>%
+  ggplot(aes(x = share_female)) +
+    geom_histogram() +
+    facet_wrap(~oc2)
+
+```
+
+For more details, we print summary statistics for each sector below.
+
+```{r share-female-summary}
+
+tapply(correlation_data$share_female, correlation_data$oc2, summary)
+
+```
+
+#### Outliers detection
+
+As we can see, this variable also features many outliers, which leads us to again favor the use of the Spearman correlation coefficient.
+
+```{r shares-female-boxplot}
+
+correlation_data %>% 
+  ggplot(aes(x = oc2, y = share_female)) +
+  geom_boxplot()
+
+```
+
+### Calculation and visualization of correlations
+
+```{r corr-shares-female, fig.dim = c(9, 12)}
+
+plot_list <- list() 
+
+for (i in c("Aquaculture", "Inland fishing", "Marine fishing")) {
+ 
+  # outliers_prc <- correlation_data %>%
+  #   filter(oc2 == i) %>%
+  #   filter(!is.na(outlier_either)) %>%
+  #   summarise(sum(outlier_either)/n()) %>%
+  #   pull() %>%
+  #   round(2)
+  
+  corr_coef <- correlation_data %>%
+    filter(oc2 == i) %$%
+    cor(share_female, gdp, method = "spearman", use = "complete.obs") %>%
+    round(2)
+  
+  plot_list[[i]] <- correlation_data %>%
+    filter(oc2 == i) %>%
+    ggplot(aes(x = gdp, y = share_female
+               # , color = outlier_either
+               )) +
+      geom_point(alpha = 0.3) +
+      # geom_smooth(method = 'lm', formula = y ~ x, se = FALSE) +
+      # scale_color_manual(values = c("TRUE" = "coral"),guide = "none") +
+      labs(title = i, 
+           subtitle = paste0("Spearman correlation coefficient: ", corr_coef
+                             # , ". Outliers shown in orange."
+                             ), 
+           # caption = paste0("Proportion of outliers: ", outliers_prc),
+           x = "GDP (USD/capita/year)", 
+           y = "Share of female employment") +
+      scale_x_continuous(labels = addUnits)
+   
+}
+
+grid.arrange(grobs = plot_list, ncol = 1)
+
+```
+
+## Correlation: share of female employment vs productivity
+
+### Calculation and visualization of correlations
+
+```{r corr-shares-female-productivity, fig.dim = c(9, 12)}
+
+plot_list <- list() 
+
+for (i in c("Aquaculture", "Inland fishing", "Marine fishing")) {
+ 
+  # outliers_prc <- correlation_data %>%
+  #   filter(oc2 == i) %>%
+  #   filter(!is.na(outlier_either)) %>%
+  #   summarise(sum(outlier_either)/n()) %>%
+  #   pull() %>%
+  #   round(2)
+  
+  corr_coef <- correlation_data %>%
+    filter(oc2 == i) %$%
+    cor(share_female, value_productivity, method = "spearman", use = "complete.obs") %>%
+    round(2)
+  
+  plot_list[[i]] <- correlation_data %>%
+    filter(oc2 == i) %>%
+    ggplot(aes(x = share_female, y = value_productivity
+               # , color = outlier_either
+               )) +
+      geom_point(alpha = 0.3) +
+      # geom_smooth(method = 'lm', formula = y ~ x, se = FALSE) +
+      # scale_color_manual(values = c("TRUE" = "coral"),guide = "none") +
+      labs(title = i, 
+           subtitle = paste0("Spearman correlation coefficient: ", corr_coef
+                             # , ". Outliers shown in orange."
+                             ), 
+           # caption = paste0("Proportion of outliers: ", outliers_prc),
+           x = "Share of female employment", 
+           y = "Productivity (tonnes/worker/year)") +
+      scale_x_continuous(labels = addUnits)
+   
+}
+
+grid.arrange(grobs = plot_list, ncol = 1)
+
+```
+
+# Panel data regression
+
+We model log labour productivity (tonnes per worker per year) separately for each sector, with country-year observations. The simple model includes the female share, the share of part-time and occasional workers, and GDP per capita (thousand 2021 PPP \$); the extended model adds trade openness and the Gini index and its square. We estimate pooled OLS (no country or year effects), two-way fixed effects (country and year effects) and random effects with year dummies. No model includes a time trend. The coefficients describe associations within the sample, not causal effects.
+
+## A note on regression tables
+
+All regression tables below are built with `reg_table()`, defined in the chunk below. Each table reports:
+
+- coefficients with **95% confidence intervals** in brackets, computed with the same standard errors as the significance stars (conventional standard errors, or standard errors clustered by country in the robust tables);
+- the number of **observations**, **countries** and **years** (with the period covered) of each model;
+- the **within, between and overall R²**, computed as in Stata's `xtreg`: the squared correlation between the dependent variable and the model's linear prediction, after removing each country's mean (within), between the country means (between), and on the raw data (overall). For the two-way fixed-effects models, the linear prediction includes the year effects, so the within R² also reflects the year effects.
+
+The F statistic is shown only in the tables with conventional standard errors, because it is not robust to heteroskedasticity or serial correlation.
+
+## Preparing the panel data regression dataset
+
+The share of part-time and occasional workers is (part-time + occasional) / (part-time + occasional + full-time). Workers of unspecified status are excluded, and the share is missing when every worker's status is unspecified.
+
+```{r share-part-occ}
+
+share_part_occ <- emp_data %>%
+  group_by(geographic_area, oc2, working_time, year) %>%
+  summarise(value = sum(value)) %>%
+  ungroup() %>%
+  pivot_wider(names_from = working_time, values_from = value, values_fill = 0) %>%
+  mutate(conc = paste(geographic_area, oc2, year, sep = " | "),
+         share_part_occ = (`Part time` + `Occasional`)/(`Part time` + `Occasional` + `Full time`),
+         share_part_occ = ifelse(is.nan(share_part_occ), NA, share_part_occ)) %>%
+  select(conc, share_part_occ)
+
+share_part_occ
+
+```
+
+We add the part-time share to the correlation dataset, take the log of productivity and express GDP per capita in thousands. Country-years with zero production have no productivity and are excluded (see chunk `join-productivity`). Country-years with no recorded women (F = 0) are kept with a female share of zero; those with no sex-disaggregated data have a missing share and drop out of the models.
+
+```{r reg-data-prep}
+
+reg_data <- correlation_data %>%
+  mutate(entity = paste(geographic_area, oc2, sep = " | "),
+         conc = paste(geographic_area, oc2, year, sep = " | ")) %>%
+  left_join(share_part_occ) %>%
+  mutate(log_value_productivity = log(value_productivity)) %>% 
+  filter(value_prod > 0) %>% # country-years with production (zero production has no productivity, see chunk `join-productivity`)
+  mutate(gdp = gdp / 1000)
+
+```
+
+## Additional explanatory variables
+
+We add additional explanatory variables in an attempt to increase the explanatory power of the models.
+
+### World Bank's trade as % of GDP as a variable for trade openness
+
+```{r trade-data}
+
+trade_data <- read_csv("./inputs/wb_trade_openness.csv") %>%
+  clean_names() %>%
+  pivot_longer(x1995:last_col(), names_to = "year", values_to = "value") %>%
+  mutate(year = as.integer(str_sub(year,-4,-1))) %>%
+  left_join(country_code_mapping, by = c("country_code" = "iso3_code")) %>%
+  select(country_name, un_code, year, value)
+
+trade_data
+
+trade_data_join <- trade_data %>%
+  unite("conc_trade", c("un_code", "year"), sep = "|") %>%
+  rename(trade_openness = value) %>%
+  select(conc_trade, trade_openness)
+
+```
+
+### World Bank's GINI as a variable for economic inequality
+
+```{r social-inequality}
+
+social_inequality <- read_csv("./inputs/wb_gini.csv") %>%
+  clean_names() %>%
+  pivot_longer(x1995:last_col(), names_to = "year", values_to = "value") %>%
+  mutate(year = as.integer(str_sub(year,-4,-1))) %>%
+  left_join(country_code_mapping, by = c("iso3" = "iso3_code")) %>%
+  select(name, un_code, year, value)
+
+social_inequality
+
+social_inequality_join <- social_inequality %>%
+  unite("conc_social_inequality", c("un_code", "year"), sep = "|") %>%
+  rename(social_inequality = value) %>%
+  select(conc_social_inequality, social_inequality)
+
+```
+
+```{r additional-variables}
+
+reg_data <- reg_data %>%
+  unite("conc", c("un_code", "year"), sep = "|", remove = FALSE) %>%
+  left_join(trade_data_join, by = c("conc" = "conc_trade")) %>%
+  left_join(social_inequality_join, by = c("conc" = "conc_social_inequality")) %>%
+  select(-conc)
+
+```
+
+## Checking the assumptions of linear regression
+
+### Normality of the dependent variable
+
+As we can see below, our dependent variable (value_productivity) is not normally distributed, but this can be fixed by a natural logarithm transformation.
+
+```{r reg-normality-check, fig.dim = c(8, 12)}
+
+library(ggpubr)
+
+plot_prod <- reg_data %>%
+  ggplot(aes(x = value_productivity)) +
+  geom_histogram() +
+  labs(title = "Histogram of productivity",
+       subtitle = "No transformation")
+
+plot_prod_log <- reg_data %>%
+  ggplot(aes(x = log_value_productivity)) +
+  geom_histogram() + 
+  labs(title = "Histogram of productivity",
+       subtitle = "Natural logarithm transformation",
+       x = "log(value_productivity)")
+
+ggarrange(plot_prod, plot_prod_log,
+          nrow = 2)
+
+```
+
+### Linearity and absence of multicollinearity
+
+```{r reg-linearity-check, fig.dim = c(9, 12)}
+
+library(corrplot)
+
+par(mfrow = c(3, 1))
+
+reg_data %>%
+  filter(oc2 == "Aquaculture") %>%
+  select(log_value_productivity, share_female, share_part_occ, gdp, trade_openness, social_inequality) %>%
+  cor(use = "complete.obs") %>%
+  corrplot(method = "number", type = "upper", diag = FALSE, main = "Aquaculture")
+
+reg_data %>%
+  filter(oc2 == "Inland fishing") %>%
+  select(log_value_productivity, share_female, share_part_occ, gdp, trade_openness, social_inequality) %>%
+  cor(use = "complete.obs") %>%
+  corrplot(method = "number", type = "upper", diag = FALSE, main = "Inland fishing")
+
+reg_data %>%
+  filter(oc2 == "Marine fishing") %>%
+  select(log_value_productivity, share_female, share_part_occ, gdp, trade_openness, social_inequality) %>%
+  cor(use = "complete.obs") %>%
+  corrplot(method = "number", type = "upper", diag = FALSE, main = "Marine fishing")
+
+```
+
+## OLS regression
+
+### Restricted model
+
+```{r ols-reg, results='asis'}
+
+library(stargazer) # package used to create neat tables of regression results
+
+oaqua <- lm(log_value_productivity ~ share_female + share_part_occ + gdp, data = reg_data %>% filter(oc2 == "Aquaculture"))
+oinfishing <- lm(log_value_productivity ~ share_female + share_part_occ + gdp, data = reg_data %>% filter(oc2 == "Inland fishing"))
+omarfishing <- lm(log_value_productivity ~ share_female + share_part_occ + gdp, data = reg_data %>% filter(oc2 == "Marine fishing"))
+
+reg_table(list(oaqua, oinfishing, omarfishing))
+
+```
+
+### Extended model
+
+```{r ols-reg-ext, results='asis'}
+
+oaqua_ext <- lm(log_value_productivity ~ share_female + share_part_occ + gdp + trade_openness + social_inequality + I(social_inequality^2), data = reg_data %>% filter(oc2 == "Aquaculture"))
+oinfishing_ext <- lm(log_value_productivity ~ share_female + share_part_occ + gdp + trade_openness + social_inequality + I(social_inequality^2), data = reg_data %>% filter(oc2 == "Inland fishing"))
+omarfishing_ext <- lm(log_value_productivity ~ share_female + share_part_occ + gdp + trade_openness + social_inequality + I(social_inequality^2), data = reg_data %>% filter(oc2 == "Marine fishing"))
+
+reg_table(list(oaqua_ext, oinfishing_ext, omarfishing_ext))
+
+```
+
+## Fixed-effects panel data regression
+
+Let's run a fixed-effects regression for each sector (aquaculture, inland fishing, marine fishing), using the covariates we described above.
+
+### Restricted model
+
+```{r fixed-effects, results = 'asis'}
+
+library(plm) # package used to estimate linear panel regression models
+
+faqua <- plm(log_value_productivity ~ share_female + share_part_occ + gdp,
+                    data = reg_data %>% filter(oc2 == "Aquaculture"),
+                    index = c("entity", "year"),
+                    effect = "twoways",
+                    model = "within")
+finfishing <- plm(log_value_productivity ~ share_female + share_part_occ + gdp,
+                    data = reg_data %>% filter(oc2 == "Inland fishing"),
+                    index = c("entity", "year"),
+                    effect = "twoways",
+                    model = "within")
+fmarfishing <- plm(log_value_productivity ~ share_female + share_part_occ + gdp,
+                    data = reg_data %>% filter(oc2 == "Marine fishing"),
+                    index = c("entity", "year"),
+                    effect = "twoways",
+                    model = "within")
+
+reg_table(list(faqua, finfishing, fmarfishing))
+
+```
+
+### Extended model
+
+```{r fixed-effects-ext, results = 'asis'}
+
+faqua_ext <- plm(log_value_productivity ~ share_female + share_part_occ + gdp + trade_openness + social_inequality + I(social_inequality^2),
+                    data = reg_data %>% filter(oc2 == "Aquaculture"),
+                    index = c("entity", "year"),
+                    effect = "twoways",
+                    model = "within")
+finfishing_ext <- plm(log_value_productivity ~ share_female + share_part_occ + gdp + trade_openness + social_inequality + I(social_inequality^2),
+                    data = reg_data %>% filter(oc2 == "Inland fishing"),
+                    index = c("entity", "year"),
+                    effect = "twoways",
+                    model = "within")
+fmarfishing_ext <- plm(log_value_productivity ~ share_female + share_part_occ + gdp + trade_openness + social_inequality + I(social_inequality^2),
+                    data = reg_data %>% filter(oc2 == "Marine fishing"),
+                    index = c("entity", "year"),
+                    effect = "twoways",
+                    model = "within")
+
+reg_table(list(faqua_ext, finfishing_ext, fmarfishing_ext))
+
+```
+
+### F test for individual effects
+
+We run an F test for individual effects to confirm that the fixed effects model is more adapted to our data compared to the regular regression model. Here, a significant p-value indicates that the fixed effects model is more suited to our data.
+
+#### Restricted model
+
+```{r individual-effects-test}
+
+# Testing for fixed effects, null: OLS better than fixed
+
+tribble(
+  ~Model, ~`F Test for Individual and/or Time Effects`,
+  "Aquaculture",   pFtest(faqua, oaqua)$p.value,
+  "Inland fishing",   pFtest(finfishing, oinfishing)$p.value,
+  "Marine fishing",   pFtest(fmarfishing, omarfishing)$p.value
+)
+
+```
+
+#### Extended model
+
+```{r individual-effects-test-ext}
+
+# Testing for fixed effects, null: OLS better than fixed
+
+tribble(
+  ~Model, ~`F Test for Individual and/or Time Effects`,
+  "Aquaculture",   pFtest(faqua_ext, oaqua_ext)$p.value,
+  "Inland fishing",   pFtest(finfishing_ext, oinfishing_ext)$p.value,
+  "Marine fishing",   pFtest(fmarfishing_ext, omarfishing_ext)$p.value
+)
+
+```
+
+## Random effects model
+
+We now run a random effects model and compare its results to the fixed effects'.
+
+### Restricted model
+
+```{r random-effects, results='asis'}
+
+raqua <- plm(log_value_productivity ~ share_female + share_part_occ + gdp + factor(year), 
+                    data = reg_data %>% filter(oc2 == "Aquaculture"),
+                    index = c("entity", "year"), 
+                    model = "random",
+                    random.method = "amemiya")
+rinfishing <- plm(log_value_productivity ~ share_female + share_part_occ + gdp + factor(year), 
+                    data = reg_data %>% filter(oc2 == "Inland fishing"),
+                    index = c("entity", "year"), 
+                    model = "random",
+                    random.method = "amemiya")
+rmarfishing <- plm(log_value_productivity ~ share_female + share_part_occ + gdp + factor(year), 
+                    data = reg_data %>% filter(oc2 == "Marine fishing"),
+                    index = c("entity", "year"), 
+                    model = "random",
+                    random.method = "amemiya")
+
+reg_table(list(raqua, rinfishing, rmarfishing)) # year dummies are not shown
+
+# Table S5 C of the Supplement (conventional standard errors)
+export_reg_table(list(raqua, rinfishing, rmarfishing), "./outputs/tables/tableS5C.csv")
+
+```
+
+### Extended model
+
+```{r random-effects-ext, results='asis'}
+
+raqua_ext <- plm(log_value_productivity ~ share_female + share_part_occ + gdp + trade_openness + social_inequality + I(social_inequality^2) + factor(year), 
+                    data = reg_data %>% filter(oc2 == "Aquaculture"),
+                    index = c("entity", "year"), 
+                    model = "random",
+                    random.method = "amemiya")
+rinfishing_ext <- plm(log_value_productivity ~ share_female + share_part_occ + gdp + trade_openness + social_inequality + I(social_inequality^2) + factor(year), 
+                    data = reg_data %>% filter(oc2 == "Inland fishing"),
+                    index = c("entity", "year"), 
+                    model = "random",
+                    random.method = "amemiya")
+rmarfishing_ext <- plm(log_value_productivity ~ share_female + share_part_occ + gdp + trade_openness + social_inequality + I(social_inequality^2) + factor(year), 
+                    data = reg_data %>% filter(oc2 == "Marine fishing"),
+                    index = c("entity", "year"), 
+                    model = "random",
+                    random.method = "amemiya")
+
+reg_table(list(raqua_ext, rinfishing_ext, rmarfishing_ext)) # year dummies are not shown
+
+```
+
+## Choosing between fixed- or random-effects
+
+### Hausman test
+
+The Hausman test allows us to determine which of the fixed- or random-effects model is more suited to the data. Here, the random effects model is preferred under the null hypothesis.
+
+#### Restricted model
+
+```{r hausman-test}
+
+# If the p-value is significant then use fixed effects, if not use random effects.
+
+hausman_results <- tribble(
+  ~Model, ~`Hausman test p-value`,
+  "Aquaculture",   round(phtest(faqua, raqua)$p.value, digits = 3),
+  "Inland fishing",   round(phtest(finfishing, rinfishing)$p.value, digits = 3),
+  "Marine fishing",   round(phtest(fmarfishing, rmarfishing)$p.value, digits = 3)
+)
+
+hausman_results
+
+```
+
+#### Extended model
+
+```{r hausman-test-ext}
+
+# If the p-value is significant then use fixed effects, if not use random effects.
+
+tribble(
+  ~Model, ~`Hausman test p-value`,
+  "Aquaculture",   round(phtest(faqua_ext, raqua_ext)$p.value, digits = 3),
+  "Inland fishing",   round(phtest(finfishing_ext, rinfishing_ext)$p.value, digits = 3),
+  "Marine fishing",   round(phtest(fmarfishing_ext, rmarfishing_ext)$p.value, digits = 3)
+)
+
+```
+
+### Mundlak test
+
+An alternative to the Hausman test is the Mundlak test [@mundlak1978pooling], which adds entity-level means of the time-varying regressors to the RE model and test the joint significance of those means.
+
+While the Hausman test assumes homoskedastic and serially uncorrelated errors, the Mundlak test can use country-clustered standard errors, which is more robust.
+
+#### Restricted model
+
+```{r mundlak-test}
+
+library(car)      # linearHypothesis(): Wald test of joint significance
+library(sandwich) # cluster-robust covariance matrices
+
+# If the p-value is significant then use fixed effects, if not use random effects.
+
+mundlak_results <- bind_rows(
+  mundlak_test(faqua)       %>% mutate(Model = "Aquaculture",    .before = 1),
+  mundlak_test(finfishing)  %>% mutate(Model = "Inland fishing", .before = 1),
+  mundlak_test(fmarfishing) %>% mutate(Model = "Marine fishing", .before = 1)
+  ) %>%
+  mutate(`Preferred model (robust test, 5%)` = ifelse(`p-value (robust)` < 0.05, "Fixed effects", "Random effects"))
+
+mundlak_results
+
+# Table S5 A of the Supplement: Hausman test (chunk `hausman-test`) and cluster-robust Mundlak test
+tableS5A <- hausman_results %>%
+  left_join(mundlak_results, by = "Model") %>%
+  transmute(Sector = Model,
+            `Hausman p-value` = `Hausman test p-value`,
+            `Mundlak p-value (cluster-robust)` = `p-value (robust)`,
+            `Estimator used` = `Preferred model (robust test, 5%)`)
+
+write_csv(tableS5A, "./outputs/tables/tableS5A.csv")
+
+```
+
+#### Extended model
+
+```{r mundlak-test-ext}
+
+# If the p-value is significant then use fixed effects, if not use random effects.
+
+mundlak_results_ext <- bind_rows(
+  mundlak_test(faqua_ext)       %>% mutate(Model = "Aquaculture",    .before = 1),
+  mundlak_test(finfishing_ext)  %>% mutate(Model = "Inland fishing", .before = 1),
+  mundlak_test(fmarfishing_ext) %>% mutate(Model = "Marine fishing", .before = 1)
+  ) %>%
+  mutate(`Preferred model (robust test, 5%)` = ifelse(`p-value (robust)` < 0.05, "Fixed effects", "Random effects"))
+
+mundlak_results_ext
+
+```
+
+## Further tests and refining of the model
+
+### Heteroskedasticity
+
+We use the Breusch-Pagan test to detect the potential presence of heteroskedasticity in the data. Here, the null hypothesis corresponds to a lack of heteroskedasticity.
+
+#### Restricted model
+
+```{r heteroskedasticity}
+
+library(lmtest)
+
+# Test for the presence of heteroskedasticity (if p-value is significant)
+
+tribble(
+  ~Model, ~`Breusch-Pagan test p-value`,
+  "Aquaculture (fixed effects)",   bptest(faqua, studentize = FALSE)$p.value,
+  "Inland fishing (random effects)",   bptest(rinfishing, studentize = FALSE)$p.value,
+  "Marine fishing (random effects)",   bptest(rmarfishing, studentize = FALSE)$p.value
+)
+
+```
+
+#### Extended model
+
+```{r heteroskedasticity-ext}
+
+# Test for the presence of heteroskedasticity (if p-value is significant)
+
+tribble(
+  ~Model, ~`Breusch-Pagan test p-value`,
+  "Aquaculture (fixed effects)",   bptest(faqua_ext, studentize = FALSE)$p.value,
+  "Inland fishing (fixed effects)",   bptest(finfishing_ext, studentize = FALSE)$p.value,
+  "Marine fishing (fixed effects)",   bptest(fmarfishing_ext, studentize = FALSE)$p.value
+)
+
+```
+
+### Serial correlation
+
+We use the Breusch-Godfrey/Wooldridge test to detect the potential presence of serial correlation in the data. Here the null hypothesis corresponds to a lack of serial correlation.
+
+#### Restricted model
+
+```{r serial-correlation}
+
+# Test for the presence of serial correlation (if p-value is significant)
+
+tribble(
+  ~Model, ~`Breusch-Godfrey/Wooldridge test p-value`,
+  "Aquaculture (fixed effects)",   pbgtest(faqua)$p.value,
+  "Inland fishing (random effects)",   pbgtest(rinfishing)$p.value,
+  "Marine fishing (random effects)",   pbgtest(rmarfishing)$p.value
+)
+
+```
+
+#### Extended model
+
+```{r serial-correlation-ext}
+
+# Test for the presence of serial correlation (if p-value is significant)
+
+tribble(
+  ~Model, ~`Breusch-Godfrey/Wooldridge test p-value`,
+  "Aquaculture (fixed effects)",   pbgtest(faqua_ext)$p.value,
+  "Inland fishing (fixed effects)",   pbgtest(finfishing_ext)$p.value,
+  "Marine fishing (fixed effects)",   pbgtest(fmarfishing_ext)$p.value
+)
+
+```
+
+### Country-clustered robust standard errors
+
+#### Restricted model
+
+```{r robust-se, results='asis'}
+
+# Standard errors, confidence intervals and stars clustered by country
+# (Arellano, HC1). Models follow the robust Mundlak test: FE for aquaculture, RE for inland and marine fishing.
+reg_table(list(faqua, rinfishing, rmarfishing), se_type = "cluster")
+
+# Table 2 of the paper
+export_reg_table(list(faqua, rinfishing, rmarfishing), "./outputs/tables/table2.csv", se_type = "cluster")
+
+```
+
+#### Extended model
+
+```{r robust-se-ext, results='asis'}
+
+# Standard errors, confidence intervals and stars clustered by country (Arellano, HC1)
+reg_table(list(faqua_ext, finfishing_ext, fmarfishing_ext), se_type = "cluster")
+
+# Table S8 A of the Supplement
+export_reg_table(list(faqua_ext, finfishing_ext, fmarfishing_ext), "./outputs/tables/tableS8A.csv", se_type = "cluster")
+
+```
+
+# Further analysis and sensitivity checks
+
+This section contains the additional checks requested by the reviewers. It reuses the data and models above without changing them. Unless stated otherwise, each check re-estimates the models of the robust tables (chunks `robust-se` and `robust-se-ext`):
+
+- restricted model: fixed effects for aquaculture, random effects for inland and marine fishing;
+- extended model: fixed effects for the three sectors;
+- standard errors clustered by country.
+
+```{r further-setup}
+
+sectors <- c("Aquaculture", "Inland fishing", "Marine fishing")
+
+dir.create("./outputs/tables", showWarnings = FALSE, recursive = TRUE)
+
+# Model formulas used in the main analysis
+
+f_restricted <- log_value_productivity ~ share_female + share_part_occ + gdp
+f_extended   <- log_value_productivity ~ share_female + share_part_occ + gdp + trade_openness + social_inequality + I(social_inequality^2)
+
+# Functions that re-estimate the models of the robust tables with another formula or dataset
+
+restricted_models <- function(formula, data) {
+  # Random-effects models include year dummies. The formula is built on its own line: written inside plm(),
+  # stargazer would read "formula" instead of the name of the dependent variable.
+  formula_re <- update(formula, . ~ . + factor(year))
+  list(
+    plm(formula,
+        data = data %>% filter(oc2 == "Aquaculture"),
+        index = c("entity", "year"), effect = "twoways", model = "within"),
+    plm(formula_re,
+        data = data %>% filter(oc2 == "Inland fishing"),
+        index = c("entity", "year"), model = "random", random.method = "amemiya"),
+    plm(formula_re,
+        data = data %>% filter(oc2 == "Marine fishing"),
+        index = c("entity", "year"), model = "random", random.method = "amemiya")
+  )
+}
+
+extended_models <- function(formula, data) {
+  list(
+    plm(formula, data = data %>% filter(oc2 == "Aquaculture"),
+        index = c("entity", "year"), effect = "twoways", model = "within"),
+    plm(formula, data = data %>% filter(oc2 == "Inland fishing"),
+        index = c("entity", "year"), effect = "twoways", model = "within"),
+    plm(formula, data = data %>% filter(oc2 == "Marine fishing"),
+        index = c("entity", "year"), effect = "twoways", model = "within")
+  )
+}
+
+```
+
+## Fixed effects for all three sectors
+
+The restricted model in the robust table (chunk `robust-se`) uses fixed effects for aquaculture and random effects for inland and marine fishing, as selected by the robust Mundlak test (chunk `mundlak-test`). For comparison, the table below reports the two-way fixed-effects models of chunk `fixed-effects` for all three sectors, with the same country-clustered standard errors (Table S5 B of the Supplement). The aquaculture column is the same as in the robust table. The random-effects models of all three sectors, with conventional standard errors, are in chunk `random-effects` (Table S5 C).
+
+```{r fixed-effects-cluster, results='asis'}
+
+# Two-way fixed effects for the three sectors, standard errors clustered by country (Arellano, HC1)
+reg_table(list(faqua, finfishing, fmarfishing), se_type = "cluster")
+
+# Table S5 B of the Supplement
+export_reg_table(list(faqua, finfishing, fmarfishing), "./outputs/tables/tableS5B.csv", se_type = "cluster")
+
+```
+
+## Standard errors robust to cross-sectional dependence
+
+Reviewer 3 raised common year shocks and cross-sectional dependence. Year shocks that affect all countries in the same way are already absorbed by the year effects of the models. Shocks that affect countries differently, or spill over between them, can leave residuals correlated across countries. The country-clustered standard errors used above do not account for this. We therefore compare them with:
+
+- **Driscoll–Kraay standard errors** [@driscoll1998consistent]. They are robust to correlation across countries and to serial correlation (here up to 2 years, the usual rule $T^{1/4}$ with $T = 29$ years). They require a long time dimension, so with 29 years they are a robustness check.
+- **Two-way clustered standard errors** by country and by year [@cameron2011robust]. They allow for correlation within each country (all years) and within each year (all countries).
+
+The two-way formula subtracts a third term and can occasionally give a negative variance. In that case we use the version without that term, which is conservative [@mackinnon2023cluster], and the table says so.
+
+First, the Pesaran CD test [@pesaran2015testing] checks whether the residuals are correlated across countries (null hypothesis: no cross-sectional dependence).
+
+```{r cd-test}
+
+cd_results <- tribble(
+  ~Model, ~`Pesaran CD test p-value`,
+  "Aquaculture, restricted (fixed effects)",     pcdtest(faqua)$p.value,
+  "Inland fishing, restricted (random effects)", pcdtest(rinfishing)$p.value,
+  "Marine fishing, restricted (random effects)", pcdtest(rmarfishing)$p.value,
+  "Aquaculture, extended (fixed effects)",       pcdtest(faqua_ext)$p.value,
+  "Inland fishing, extended (fixed effects)",    pcdtest(finfishing_ext)$p.value,
+  "Marine fishing, extended (fixed effects)",    pcdtest(fmarfishing_ext)$p.value
+)
+
+cd_results
+
+# Table S6 A of the Supplement
+write_csv(cd_results, "./outputs/tables/tableS6A.csv")
+
+```
+
+The tables below give, for each coefficient, the standard error under each method, with significance stars (\*p\<0.1; \*\*p\<0.05; \*\*\*p\<0.01). The coefficients themselves do not change.
+
+```{r se-comparison}
+
+# Standard errors with significance stars, for a given covariance matrix
+se_with_stars <- function(model, vcov_matrix) {
+  test <- coeftest(model, vcov. = vcov_matrix)
+  stars <- ifelse(test[, 4] < 0.01, "***", ifelse(test[, 4] < 0.05, "**", ifelse(test[, 4] < 0.1, "*", "")))
+  paste0(sprintf("%.3f", test[, 2]), stars)
+}
+
+# Two-way clustered covariance matrix (country and year). If it is not positive semi-definite
+# for the variables of interest, use the conservative version without the intersection term.
+vcov_twoway <- function(model) {
+  V <- vcovDC(model, type = "HC1")
+  variables <- !grepl("factor\\(year\\)|Intercept", colnames(V))
+  if (min(eigen(V[variables, variables])$values) < 0) {
+    V <- vcovHC(model, method = "arellano", type = "HC1", cluster = "group") +
+         vcovHC(model, method = "arellano", type = "HC1", cluster = "time")
+    attr(V, "version") <- "Without intersection term"
+  }
+  V
+}
+
+compare_se <- function(model, sector) {
+  V_twoway <- vcov_twoway(model)
+  tibble(
+    Sector = sector,
+    Model = model_type(model),
+    Variable = names(coef(model)),
+    Coefficient = sprintf("%.3f", coef(model)),
+    `SE clustered by country` = se_with_stars(model, model_vcov(model, "cluster")),
+    `SE Driscoll-Kraay` = se_with_stars(model, vcovSCC(model, type = "HC1", maxlag = 2)),
+    `SE two-way clustered` = se_with_stars(model, V_twoway),
+    `Two-way version` = ifelse(is.null(attr(V_twoway, "version")), "Standard", attr(V_twoway, "version"))
+  ) %>%
+    filter(!grepl("factor\\(year\\)|Intercept", Variable)) %>%  # year dummies and intercept not shown
+    mutate(Variable = label_variables(Variable))                  # descriptive names (chunk `functions`)
+}
+
+se_restricted <- bind_rows(
+  compare_se(faqua, "Aquaculture"),
+  compare_se(rinfishing, "Inland fishing"),
+  compare_se(rmarfishing, "Marine fishing")
+)
+
+se_extended <- bind_rows(
+  compare_se(faqua_ext, "Aquaculture"),
+  compare_se(finfishing_ext, "Inland fishing"),
+  compare_se(fmarfishing_ext, "Marine fishing")
+)
+
+se_restricted
+se_extended
+
+# Table S6 B of the Supplement reports the restricted (main) models only
+write_csv(se_restricted, "./outputs/tables/tableS6B.csv")
+
+```
+
+## Functional form: log productivity and income in levels or logs
+
+**Log of productivity.** Productivity (tonnes per worker) is strongly right-skewed: across countries it spans several orders of magnitude, and a few very high values would dominate a model in levels. Its logarithm is close to symmetric (table below and histograms in chunk `reg-normality-check`), which reduces the weight of extreme values. The coefficients can then be read as approximate percentage changes in productivity, which makes countries with very different productivity levels comparable. Productivity is also a ratio, and its log is the difference between log production and log employment. The cost is that country-years with zero production are left out, because their log is undefined; for consistency, they are left out of all productivity analyses (step 2 of the sample flow below).
+
+**Income in levels or logs.** GDP per capita is also right-skewed. In levels (main models, thousand 2021 PPP dollars), the coefficient is the approximate % change in productivity for each additional $1,000 per capita, the same for poor and rich countries. In logs, it is the % change in productivity for a 1% increase in GDP per capita, so the association in dollars weakens as income rises. The models below replace GDP per capita by its logarithm; the other variables are unchanged. GDP per capita is in thousands, which changes log(GDP) only by a constant and does not affect the coefficient. If the sign or significance of income differs between the two versions, the conclusion about income depends on the functional form.
+
+```{r skewness}
+
+# Skewness: 0 for a symmetric distribution, positive when there is a long tail of high values
+skewness <- function(x) {
+  x <- x[!is.na(x)]
+  mean((x - mean(x))^3) / sd(x)^3
+}
+
+reg_data %>%
+  group_by(Sector = oc2) %>%
+  summarise(`Skew(Productivity)` = round(skewness(value_productivity), 2),
+            `Skew(Log productivity)` = round(skewness(log_value_productivity), 2),
+            `Skew(GDP per capita)` = round(skewness(gdp), 2),
+            `Skew(Log GDP per capita)` = round(skewness(log(gdp)), 2))
+
+```
+
+```{r log-gdp, results='asis'}
+
+f_restricted_log <- log_value_productivity ~ share_female + share_part_occ + log(gdp)
+f_extended_log   <- log_value_productivity ~ share_female + share_part_occ + log(gdp) + trade_openness + social_inequality + I(social_inequality^2)
+
+reg_table(restricted_models(f_restricted_log, reg_data), se_type = "cluster")
+reg_table(extended_models(f_extended_log, reg_data), se_type = "cluster")
+
+```
+
+## Inequality quadratic
+
+### Centring
+
+Gini and Gini² are strongly correlated, which inflates their standard errors (see the VIFs below). Before squaring, we centre the Gini index on its mean in each sector's estimation sample: `gini_centred = Gini - mean(Gini)`. This does not change the fit of the model or the coefficient of the squared term. Only the linear term changes meaning: it becomes the effect of inequality at the average Gini.
+
+```{r gini-centred, results='asis'}
+
+# Mean Gini in the estimation sample of each extended model (observations with all variables available)
+gini_means <- reg_data %>%
+  filter(!is.na(log_value_productivity), !is.na(share_female), !is.na(share_part_occ),
+         !is.na(gdp), !is.na(trade_openness), !is.na(social_inequality)) %>%
+  group_by(oc2) %>%
+  summarise(gini_mean = mean(social_inequality))
+
+gini_means
+
+reg_data_centred <- reg_data %>%
+  left_join(gini_means, by = "oc2") %>%
+  mutate(gini_centred = social_inequality - gini_mean)
+
+f_extended_centred <- log_value_productivity ~ share_female + share_part_occ + gdp + trade_openness + gini_centred + I(gini_centred^2)
+
+ext_centred <- extended_models(f_extended_centred, reg_data_centred)
+
+reg_table(ext_centred, se_type = "cluster")
+
+```
+
+### Turning point
+
+With $\beta_1$ the coefficient of the centred Gini and $\beta_2$ that of its square, the turning point is $\text{Gini}^* = \overline{\text{Gini}} - \beta_1 / (2\beta_2)$. It is a maximum if $\beta_2 < 0$ and a minimum if $\beta_2 > 0$. Its standard error is obtained by the delta method with the country-clustered covariance matrix. The table also checks whether the turning point and its 95% confidence interval lie within the range of Gini values observed in the data. If the squared term is not significant, the turning point is poorly identified and its interval is very wide.
+
+```{r gini-turning-point}
+
+turning_point <- function(model, sector) {
+  gini_mean <- gini_means$gini_mean[gini_means$oc2 == sector]
+  b <- coef(model)
+  V <- model_vcov(model, "cluster")[c("gini_centred", "I(gini_centred^2)"), c("gini_centred", "I(gini_centred^2)")]
+  b1 <- unname(b["gini_centred"])
+  b2 <- unname(b["I(gini_centred^2)"])
+  # Turning point, in Gini points
+  tp <- gini_mean - b1 / (2 * b2)
+  # Delta method: gradient of -b1 / (2 * b2) with respect to b1 and b2
+  gradient <- c(-1 / (2 * b2), b1 / (2 * b2^2))
+  se <- sqrt(drop(t(gradient) %*% V %*% gradient))
+  ci <- tp + c(-1.96, 1.96) * se
+  # Range of Gini values in the estimation sample
+  gini_observed <- as.numeric(model$model$gini_centred) + gini_mean
+  tibble(
+    Sector = sector,
+    Shape = ifelse(b2 < 0, "Inverted U (maximum)", "U (minimum)"),
+    `p-value (Gini index, centred, squared)` = signif(coeftest(model, vcov. = model_vcov(model, "cluster"))["I(gini_centred^2)", 4], 3),
+    `Turning point` = round(tp, 1),
+    `95% CI (delta method)` = sprintf("[%.1f, %.1f]", ci[1], ci[2]),
+    `Observed Gini range` = sprintf("[%.1f, %.1f]", min(gini_observed), max(gini_observed)),
+    `Turning point within range` = tp >= min(gini_observed) & tp <= max(gini_observed),
+    `CI within range` = ci[1] >= min(gini_observed) & ci[2] <= max(gini_observed)
+  )
+}
+
+turning_points <- bind_rows(
+  turning_point(ext_centred[[1]], "Aquaculture"),
+  turning_point(ext_centred[[2]], "Inland fishing"),
+  turning_point(ext_centred[[3]], "Marine fishing")
+)
+
+turning_points
+
+write_csv(turning_points, "./outputs/tables/tableS8B.csv")
+
+```
+
+### Variance inflation factors
+
+VIFs are computed with `car::vif()` on the pooled OLS version of each model (same regressors). A VIF above 10 is usually considered a sign of problematic multicollinearity. The high VIFs of Gini and Gini² in the uncentred model reflect the correlation between a variable and its square, which centring removes.
+
+```{r vif}
+
+oaqua_ext_c       <- lm(f_extended_centred, data = reg_data_centred %>% filter(oc2 == "Aquaculture"))
+oinfishing_ext_c  <- lm(f_extended_centred, data = reg_data_centred %>% filter(oc2 == "Inland fishing"))
+omarfishing_ext_c <- lm(f_extended_centred, data = reg_data_centred %>% filter(oc2 == "Marine fishing"))
+
+vif_table <- function(model, sector, specification) {
+  tibble(Specification = specification, Sector = sector, Variable = label_variables(names(vif(model))), VIF = round(vif(model), 2))
+}
+
+vifs <- bind_rows(
+  vif_table(oaqua, "Aquaculture", "Restricted"),
+  vif_table(oinfishing, "Inland fishing", "Restricted"),
+  vif_table(omarfishing, "Marine fishing", "Restricted"),
+  vif_table(oaqua_ext, "Aquaculture", "Extended"),
+  vif_table(oinfishing_ext, "Inland fishing", "Extended"),
+  vif_table(omarfishing_ext, "Marine fishing", "Extended"),
+  vif_table(oaqua_ext_c, "Aquaculture", "Extended, centred Gini"),
+  vif_table(oinfishing_ext_c, "Inland fishing", "Extended, centred Gini"),
+  vif_table(omarfishing_ext_c, "Marine fishing", "Extended, centred Gini")
+) %>%
+  pivot_wider(names_from = Sector, values_from = VIF)
+
+vifs
+
+write_csv(vifs, "./outputs/tables/tableS8C.csv")
+
+```
+
+## Productivity per full-time equivalent
+
+Productivity is measured in tonnes per **person**. Part-time and occasional workers work fewer hours, so a higher share of them lowers tonnes per person even if output per hour of work does not change. Part of the negative coefficient of `share_part_occ` could therefore be mechanical. To check this, we divide production by the number of **full-time equivalents (FTE)** instead of the number of workers.
+
+**How FTEs are calculated.** FAO classifies workers by the share of their working time spent in fishing or aquaculture: full time at least 90%, part time 30% to 90%, occasional less than 30% [@cwp2026fishers]. Each worker is weighted by the midpoint of their category, the same weights as in the sensitivity analysis above (chunk `productivity-sensitivity`):
+
+| Category   | Share of working time (FAO) | FTE weight |
+|------------|-----------------------------|------------|
+| Full time  | 90% or more                 | 0.95       |
+| Part time  | 30% to 90%                  | 0.60       |
+| Occasional | less than 30%               | 0.15       |
+
+For each country, sector and year:
+
+1.  FTE per worker = (0.95 × full time + 0.60 × part time + 0.15 × occasional) / (full time + part time + occasional);
+2.  Workers whose time use is unspecified are given the same FTE per worker as those whose time use is known: FTE = FTE per worker × total number of workers;
+3.  Productivity per FTE = production / FTE.
+
+Country-years where the time use of all workers is unspecified have no FTE. They are already excluded from the models, because `share_part_occ` is missing for them, so the samples are the same as in the main models.
+
+```{r fte}
+
+fte_data <- emp_data %>%
+  filter(oc2 %in% c("Aquaculture", "Inland fishing", "Marine fishing")) %>%
+  mutate(fte_weight = case_when(
+    working_time == "Full time" ~ 0.95,
+    working_time == "Part time" ~ 0.60,
+    working_time == "Occasional" ~ 0.15    # "Status unspecified": no weight (NA)
+  )) %>%
+  group_by(geographic_area, oc2, year) %>%
+  summarise(workers_total = sum(value, na.rm = TRUE),
+            workers_known_time_use = sum(value[!is.na(fte_weight)], na.rm = TRUE),
+            fte_known_time_use = sum(value * fte_weight, na.rm = TRUE)) %>%
+  ungroup() %>%
+  mutate(fte_per_worker = ifelse(workers_known_time_use > 0, fte_known_time_use / workers_known_time_use, NA),
+         fte = fte_per_worker * workers_total,
+         conc = paste(geographic_area, oc2, year, sep = " | ")) %>%
+  select(conc, fte_per_worker, fte)
+
+reg_data_fte <- reg_data %>%
+  mutate(conc = paste(geographic_area, oc2, year, sep = " | ")) %>%
+  left_join(fte_data, by = "conc") %>%
+  mutate(log_productivity_fte = log(value_prod / fte))
+
+fte_restricted <- restricted_models(log_productivity_fte ~ share_female + share_part_occ + gdp, reg_data_fte)
+fte_extended   <- extended_models(log_productivity_fte ~ share_female + share_part_occ + gdp + trade_openness + social_inequality + I(social_inequality^2), reg_data_fte)
+
+# Coefficient of share_part_occ: productivity per worker (main analysis) vs per FTE
+
+tribble(
+  ~Model, ~`Per worker`, ~`Per FTE`,
+  "Aquaculture, restricted",    coef(faqua)["share_part_occ"],           coef(fte_restricted[[1]])["share_part_occ"],
+  "Inland fishing, restricted", coef(rinfishing)["share_part_occ"],      coef(fte_restricted[[2]])["share_part_occ"],
+  "Marine fishing, restricted", coef(rmarfishing)["share_part_occ"],     coef(fte_restricted[[3]])["share_part_occ"],
+  "Aquaculture, extended",      coef(faqua_ext)["share_part_occ"],       coef(fte_extended[[1]])["share_part_occ"],
+  "Inland fishing, extended",   coef(finfishing_ext)["share_part_occ"],  coef(fte_extended[[2]])["share_part_occ"],
+  "Marine fishing, extended",   coef(fmarfishing_ext)["share_part_occ"], coef(fte_extended[[3]])["share_part_occ"]
+) %>%
+  mutate(`Mechanical part (difference)` = `Per worker` - `Per FTE`)
+
+```
+
+The difference between the two columns is the part of the coefficient that comes only from counting people rather than FTEs. For the fixed-effects models this split is exact. For the random-effects models it is approximate, because the random-effects weighting also changes slightly with the dependent variable. If the coefficient per FTE remains negative and significant (tables below), part-time and occasional work is associated with lower productivity beyond this mechanical effect.
+
+```{r fte-tables, results='asis'}
+
+reg_table(fte_restricted, se_type = "cluster", dep.var.labels = "Log labour productivity (tonnes per FTE)")
+reg_table(fte_extended, se_type = "cluster", dep.var.labels = "Log labour productivity (tonnes per FTE)")
+
+```
+
+## Unspecified-sector employment
+
+Some countries (including major producers) report part of their employment without a sector (`oc2 == "Unspecified"`). These workers are not in the denominators of the three sectors, so the productivity of these countries is overstated. As a check, we re-estimate the models without the country-years that report any unspecified-sector employment.
+
+```{r unspecified-sector, results='asis'}
+
+country_years_unspecified <- emp_data %>%
+  filter(oc2 == "Unspecified") %>%
+  group_by(geographic_area, year) %>%
+  summarise(U = sum(value, na.rm = TRUE)) %>%
+  ungroup() %>%
+  filter(U > 0)
+
+reg_data_no_unspecified <- reg_data %>%
+  anti_join(country_years_unspecified, by = c("geographic_area", "year"))
+
+reg_table(restricted_models(f_restricted, reg_data_no_unspecified), se_type = "cluster")
+reg_table(extended_models(f_extended, reg_data_no_unspecified), se_type = "cluster")
+
+```
+
+This exclusion only concerns the models. In the descriptive figures, the productivity of the countries concerned remains overstated.
+
+## Missing sex and time-use data
+
+Some workers are reported without their sex or their working time (full time, part time or occasional). In the main models (chunks `emp_share_female` and `share-part-occ`):
+
+- the female share is F / (F + M): workers of unspecified sex are left out, and a country-year without any female record counts as zero women;
+- the share of part-time and occasional workers leaves out workers whose working time is unspecified;
+- both shares are missing, and the country-year drops out of the models, when all workers are unspecified.
+
+To test whether these choices drive the results, we re-estimate the models on three subsamples:
+
+1. **Sex fully specified**: country-years with no worker of unspecified sex;
+2. **Women recorded**: country-years with at least one female worker, which excludes the country-years where zero women may mean that women were not reported;
+3. **Working time fully specified**: country-years with no worker of unspecified working time.
+
+The tables compare the coefficients with those of the main models (country-clustered standard errors; \*p\<0.1; \*\*p\<0.05; \*\*\*p\<0.01). If they stay close, the treatment of missing sex and time-use data does not drive the results.
+
+```{r missing-sex-time-use}
+
+# Number of workers with unspecified working time, for each country, sector and year
+unspecified_time <- emp_data %>%
+  filter(working_time == "Status unspecified") %>%
+  group_by(geographic_area, oc2, year) %>%
+  summarise(workers_unspecified_time = sum(value, na.rm = TRUE)) %>%
+  ungroup()
+
+reg_data_missing <- reg_data %>%
+  left_join(unspecified_time, by = c("geographic_area", "oc2", "year")) %>%
+  mutate(workers_unspecified_time = coalesce(workers_unspecified_time, 0))
+
+# Coefficients with significance stars (country-clustered standard errors) and number of observations
+coefficients_with_stars <- function(models, sample_label) {
+  rows <- list()
+  for (i in 1:3) {
+    test <- coeftest(models[[i]], vcov. = model_vcov(models[[i]], "cluster"))
+    test <- test[!grepl("factor\\(year\\)|Intercept", rownames(test)), , drop = FALSE]
+    stars <- ifelse(test[, 4] < 0.01, "***", ifelse(test[, 4] < 0.05, "**", ifelse(test[, 4] < 0.1, "*", "")))
+    rows[[i]] <- tibble(Sample = sample_label,
+                        Sector = sectors[i],
+                        Variable = c(label_variables(rownames(test)), "Observations"),
+                        value = c(paste0(sprintf("%.3f", test[, 1]), stars), format(nobs(models[[i]]), big.mark = ",")))
+  }
+  bind_rows(rows) %>%
+    pivot_wider(names_from = Sector, values_from = value)
+}
+
+sample_sex_specified  <- reg_data_missing %>% filter(U == 0)
+sample_women_recorded <- reg_data_missing %>% filter(`F` > 0)
+sample_time_specified <- reg_data_missing %>% filter(workers_unspecified_time == 0)
+
+missing_restricted <- bind_rows(
+  coefficients_with_stars(restricted_models(f_restricted, reg_data_missing), "Main models"),
+  coefficients_with_stars(restricted_models(f_restricted, sample_sex_specified), "Sex fully specified"),
+  coefficients_with_stars(restricted_models(f_restricted, sample_women_recorded), "Women recorded"),
+  coefficients_with_stars(restricted_models(f_restricted, sample_time_specified), "Working time fully specified")
+)
+
+missing_extended <- bind_rows(
+  coefficients_with_stars(extended_models(f_extended, reg_data_missing), "Main models"),
+  coefficients_with_stars(extended_models(f_extended, sample_sex_specified), "Sex fully specified"),
+  coefficients_with_stars(extended_models(f_extended, sample_women_recorded), "Women recorded"),
+  coefficients_with_stars(extended_models(f_extended, sample_time_specified), "Working time fully specified")
+)
+
+missing_restricted
+missing_extended
+
+# The restricted-model rows are exported with the other robustness checks in Table S7 (chunk `table-s7`)
+
+```
+
+## Spearman correlations
+
+The Spearman coefficients of the correlation analysis (chunks `corr-productivities`, `corr-shares-female` and `corr-shares-female-productivity`) are **pooled**. For each sector, a single coefficient is computed on all country-years from 1995 to 2023 with both variables available. They are not calculated year by year. Each country therefore appears once per year, up to 29 times, and the pooled coefficient treats these observations as independent.
+
+To account for these repeated observations, the table below adds:
+
+- the number of observations (N) and countries behind each coefficient;
+- a 95% confidence interval obtained by resampling whole countries (bootstrap, 999 replications), so that the repeated observations of a country are kept together;
+- the correlation between country averages (one observation per country);
+- the correlations computed year by year (one observation per country): median, minimum and maximum over the years.
+
+```{r spearman}
+
+spearman_check <- function(sector, x, y, label) {
+  d <- correlation_data %>%
+    filter(oc2 == sector) %>%
+    select(un_code, year, x = all_of(x), y = all_of(y)) %>%
+    filter(!is.na(x), !is.na(y))
+
+  # Bootstrap: resample countries with replacement, keeping all their years
+  set.seed(20261109)
+  rows_by_country <- split(seq_len(nrow(d)), d$un_code)
+  bootstrap <- replicate(999, {
+    rows <- unlist(rows_by_country[sample(names(rows_by_country), replace = TRUE)])
+    cor(d$x[rows], d$y[rows], method = "spearman")
+  })
+
+  # One observation per country: averages over the years
+  country_means <- d %>% group_by(un_code) %>% summarise(x = mean(x), y = mean(y))
+
+  # One coefficient per year
+  annual <- d %>% group_by(year) %>% summarise(rho = cor(x, y, method = "spearman"))
+
+  tibble(
+    Correlation = label,
+    Sector = sector,
+    `Pooled coefficient` = round(cor(d$x, d$y, method = "spearman"), 2),
+    N = nrow(d),
+    Countries = n_distinct(d$un_code),
+    `95% CI (country bootstrap)` = sprintf("[%.2f, %.2f]", quantile(bootstrap, 0.025), quantile(bootstrap, 0.975)),
+    `Country averages` = round(cor(country_means$x, country_means$y, method = "spearman"), 2),
+    `Annual: median [min, max]` = sprintf("%.2f [%.2f, %.2f]", median(annual$rho, na.rm = TRUE),
+                                          min(annual$rho, na.rm = TRUE), max(annual$rho, na.rm = TRUE))
+  )
+}
+
+spearman_results <- bind_rows(
+  spearman_check("Aquaculture",    "value_productivity", "gdp", "Productivity vs GDP"),
+  spearman_check("Inland fishing", "value_productivity", "gdp", "Productivity vs GDP"),
+  spearman_check("Marine fishing", "value_productivity", "gdp", "Productivity vs GDP"),
+  spearman_check("Aquaculture",    "share_female", "gdp", "Female share vs GDP"),
+  spearman_check("Inland fishing", "share_female", "gdp", "Female share vs GDP"),
+  spearman_check("Marine fishing", "share_female", "gdp", "Female share vs GDP"),
+  spearman_check("Aquaculture",    "share_female", "value_productivity", "Female share vs productivity"),
+  spearman_check("Inland fishing", "share_female", "value_productivity", "Female share vs productivity"),
+  spearman_check("Marine fishing", "share_female", "value_productivity", "Female share vs productivity")
+)
+
+spearman_results
+
+write_csv(spearman_results, "./outputs/tables/tableS4.csv")
+
+# Table 1 of the paper: pooled coefficient with its strength, bootstrap CI and numbers of observations
+# Strength labels follow Schober et al. (2018): |rho| < 0.10 negligible, 0.10-0.39 weak, 0.40-0.69 moderate,
+# 0.70-0.89 strong, 0.90 or more very strong (applied to the coefficient rounded to two decimals)
+spearman_strength <- function(rho) {
+  as.character(cut(abs(rho), breaks = c(-Inf, 0.10, 0.40, 0.70, 0.90, Inf), right = FALSE,
+                   labels = c("negligible", "weak", "moderate", "strong", "very strong")))
+}
+
+table1 <- spearman_results %>%
+  transmute(Sector,
+            Correlation = case_when(Correlation == "Productivity vs GDP" ~ "Productivity vs GDP per capita",
+                                    Correlation == "Female share vs GDP" ~ "Female share vs GDP per capita",
+                                    .default = Correlation),
+            `Coefficient (strength)` = sprintf("%.2f (%s)", `Pooled coefficient`, spearman_strength(`Pooled coefficient`)),
+            `95% CI` = `95% CI (country bootstrap)`,
+            `n (country-years; countries)` = paste0(format(N, big.mark = ",", trim = TRUE), "; ", Countries)) %>%
+  pivot_longer(c(`Coefficient (strength)`, `95% CI`, `n (country-years; countries)`), names_to = "Statistic") %>%
+  pivot_wider(names_from = Correlation, values_from = value)
+
+table1
+
+write_csv(table1, "./outputs/tables/table1.csv")
+
+```
+
+## GNI per capita instead of GDP per capita
+
+The first version of the paper submitted for review used the World Bank's GNI per capita (NY.GNP.PCAP.PP.KD) as the income variable. We replaced it with GDP per capita (NY.GDP.PCAP.PP.KD) because its data coverage is much better: it is available for more countries and years, so fewer observations are lost (see the coverage comparison below). The two indicators measure closely related things. GDP per capita measures the output produced in a country. GNI per capita measures the income received by its residents: GDP plus net income from abroad (for example profits, wages and property income received from or paid to other countries). They are very close for most countries and differ mainly where these flows are large. Both are in constant 2021 international dollars (PPP).
+
+As a sensitivity check, this subsection compares the coverage of the two indicators and re-estimates the robust tables with GNI per capita. GNI per capita is used only here, so it is described below rather than in the "Data sources" table:
+
+| Publisher | Dataset | URL | Version | Used for |
+|------------|------------|-------------|------------|------------|
+| WB | GNI per capita, PPP (constant 2021 international \$) | <https://data.worldbank.org/indicator/NY.GNP.PCAP.PP.KD> | WDI update of 11 Nov 2026 | Sensitivity check (this subsection) |
+
+```{r gni-data}
+
+gni_data <- read_csv("./inputs/wb_gni.csv") %>%
+  clean_names() %>%
+  pivot_longer(x1995:last_col(), names_to = "year", values_to = "value") %>%
+  mutate(year = as.integer(str_sub(year, -4, -1))) %>%
+  left_join(country_code_mapping, by = c("country_code" = "iso3_code")) %>%
+  filter(!is.na(un_code)) %>% # remove all countries/country groupings without an equivalent in the FAO data
+  select(country_name, un_code, year, gni = value)
+
+# GDP and GNI per capita side by side, for the years of the employment data
+income_coverage <- income_data %>%
+  select(country_name, un_code, year, gdp = value) %>%
+  full_join(gni_data, by = c("un_code", "year"), suffix = c("", "_gni")) %>%
+  mutate(country_name = coalesce(country_name, country_name_gni)) %>%
+  filter(year >= min(emp_data$year), year <= max(emp_data$year))
+
+```
+
+**Coverage of the two indicators**, for the countries that have an equivalent in the FAO data:
+
+```{r gni-coverage}
+
+income_coverage %>%
+  summarise(`Country-years with GDP per capita` = sum(!is.na(gdp)),
+            `Country-years with GNI per capita` = sum(!is.na(gni)),
+            `With both` = sum(!is.na(gdp) & !is.na(gni)),
+            `GDP only` = sum(!is.na(gdp) & is.na(gni)),
+            `GNI only` = sum(is.na(gdp) & !is.na(gni)),
+            `Countries with GDP per capita` = n_distinct(un_code[!is.na(gdp)]),
+            `Countries with GNI per capita` = n_distinct(un_code[!is.na(gni)]))
+
+# Countries where the number of years available differs between the two indicators
+income_coverage %>%
+  group_by(Country = country_name) %>%
+  summarise(`Years with GDP per capita` = sum(!is.na(gdp)),
+            `Years with GNI per capita` = sum(!is.na(gni))) %>%
+  filter(`Years with GDP per capita` != `Years with GNI per capita`) %>%
+  arrange(Country)
+
+```
+
+**Effect on the model samples.** Number of observations of the robust-table models with each indicator:
+
+```{r gni-models}
+
+# Regression data with GNI per capita (in thousand dollars, like GDP per capita)
+reg_data_gni <- reg_data %>%
+  mutate(conc = paste(un_code, year, sep = "|")) %>%
+  left_join(gni_data %>% mutate(conc = paste(un_code, year, sep = "|")) %>% select(conc, gni), by = "conc") %>%
+  mutate(gni = gni / 1000) %>%
+  select(-conc)
+
+f_restricted_gni <- log_value_productivity ~ share_female + share_part_occ + gni
+f_extended_gni   <- log_value_productivity ~ share_female + share_part_occ + gni + trade_openness + social_inequality + I(social_inequality^2)
+
+gni_restricted <- restricted_models(f_restricted_gni, reg_data_gni)
+gni_extended   <- extended_models(f_extended_gni, reg_data_gni)
+
+tribble(
+  ~Model, ~`With GDP per capita`, ~`With GNI per capita`,
+  "Aquaculture, restricted",    nobs(faqua),           nobs(gni_restricted[[1]]),
+  "Inland fishing, restricted", nobs(rinfishing),      nobs(gni_restricted[[2]]),
+  "Marine fishing, restricted", nobs(rmarfishing),     nobs(gni_restricted[[3]]),
+  "Aquaculture, extended",      nobs(faqua_ext),       nobs(gni_extended[[1]]),
+  "Inland fishing, extended",   nobs(finfishing_ext),  nobs(gni_extended[[2]]),
+  "Marine fishing, extended",   nobs(fmarfishing_ext), nobs(gni_extended[[3]])
+)
+
+```
+
+**Robust tables with GNI per capita.** Same models as in chunks `robust-se` and `robust-se-ext`, with GNI per capita instead of GDP per capita (country-clustered standard errors):
+
+```{r gni-robust-se, results='asis'}
+
+reg_table(gni_restricted, se_type = "cluster")
+reg_table(gni_extended, se_type = "cluster")
+
+```
+
+## Summary of the robustness checks (Table S7)
+
+The table below collects the restricted-model coefficients of the checks above, in the order of Table S7 of the Supplement: main models (chunk `robust-se`), productivity per full-time equivalent (chunk `fte`), log GDP per capita (chunk `log-gdp`), GNI per capita (chunk `gni-models`), the three subsamples for missing sex and time-use data (chunk `missing-sex-time-use`) and the exclusion of country-years with unspecified-sector employment (chunk `unspecified-sector`). Standard errors are clustered by country (\*p\<0.1; \*\*p\<0.05; \*\*\*p\<0.01). The table is saved as `tableS7.csv`.
+
+```{r table-s7}
+
+table_s7 <- bind_rows(
+  coefficients_with_stars(restricted_models(f_restricted, reg_data), "Main models (Table 2)"),
+  coefficients_with_stars(fte_restricted, "Output per full-time equivalent"),
+  coefficients_with_stars(restricted_models(f_restricted_log, reg_data), "Log GDP per capita"),
+  coefficients_with_stars(gni_restricted, "GNI per capita in place of GDP"),
+  coefficients_with_stars(restricted_models(f_restricted, sample_sex_specified), "Sex fully specified"),
+  coefficients_with_stars(restricted_models(f_restricted, sample_women_recorded), "At least one woman recorded"),
+  coefficients_with_stars(restricted_models(f_restricted, sample_time_specified), "Working time fully specified"),
+  coefficients_with_stars(restricted_models(f_restricted, reg_data_no_unspecified),
+                          "Excluding country-years with employment without a sector")
+) %>%
+  rename(Specification = Sample)
+
+table_s7
+
+write_csv(table_s7, "./outputs/tables/tableS7.csv")
+
+```
+
+# Data documentation
+
+## Data dictionary
+
+The **unit of observation** is a country, sector and year (for example Chile, aquaculture, 2010). Each sector is modelled separately, so within a model the panel unit is the country (`entity` = country and sector), observed in each year from 1995 to 2023 for which the data are available.
+
+| Variable | Description | Unit | Source and construction |
+|---|---|---|---|
+| `geographic_area`, `un_code` | Country (or territory) | UN M49 code | FAO employment dataset |
+| `oc2` | Sector: aquaculture, inland fishing or marine fishing | – | FAO work areas: A → aquaculture; I → inland fishing; C, D, M → marine fishing |
+| `year` | Year | 1995–2023 | FAO employment dataset |
+| `value_emp` | Employment, summed over sex and working time | Number of people | FAO employment dataset |
+| `value_prod` | Production, summed over species and fishing areas | Tonnes (live weight) | FAO Global Production; quantities in number of animals are excluded |
+| `value_productivity` | Labour productivity = `value_prod` / `value_emp`; missing when production is 0 | Tonnes per worker per year | Calculated |
+| `log_value_productivity` | Natural log of productivity (dependent variable of the models) | – | Calculated |
+| `share_female` | Female share = F / (F + M); unspecified sex excluded | 0–1 | Calculated from the employment dataset |
+| `share_part_occ` | (Part time + occasional) / (full time + part time + occasional); unspecified working time excluded | 0–1 | Calculated from the employment dataset |
+| `gdp` | GDP per capita, PPP | Thousand constant 2021 international dollars (models); dollars (correlations) | World Bank, NY.GDP.PCAP.PP.KD |
+| `trade_openness` | Trade (exports + imports) | % of GDP | World Bank, NE.TRD.GNFS.ZS |
+| `social_inequality` | Gini index | 0–100 | World Bank, SI.POV.GINI |
+| `income_group_wb` | World Bank income group (descriptive figures and tables only) | Low to high | FAO country groupings |
+| `continent_mod` | Region: continents, with the Americas split into Northern America and Latin America and the Caribbean (LAC) | – | FAO country groupings |
+
+## Sample attrition and coverage
+
+### From the full panel to the estimation samples
+
+The table below starts from all countries of the FAO employment dataset, for every year and sector, and shows how many country-years remain after each step. Each cell gives the number of country-years and, in brackets, the number of countries. Step 5 is the sample of the restricted models and step 7 that of the extended models. The check table that follows confirms they match the models above.
+
+```{r sample-flow}
+
+# One row per country, sector and year, with all the variables used in the models
+cells <- expand_grid(emp_data %>% distinct(un_code, geographic_area, continent_mod, income_group_wb),
+                     oc2 = sectors,
+                     year = min(emp_data$year):max(emp_data$year)) %>%
+  left_join(emp_data_join %>% select(un_code, oc2, year, value_emp), by = c("un_code", "oc2", "year")) %>%
+  left_join(correlation_data %>% select(un_code, oc2, year, value_prod), by = c("un_code", "oc2", "year")) %>%
+  left_join(reg_data %>% select(un_code, oc2, year, share_female, share_part_occ, gdp, trade_openness, social_inequality),
+            by = c("un_code", "oc2", "year"))
+
+# Each step keeps the country-years of the previous step that meet one more condition
+cells <- cells %>%
+  mutate(step0 = TRUE,
+         step1 = !is.na(value_emp) & value_emp > 0,
+         step2 = step1 & !is.na(value_prod) & value_prod > 0,
+         step3 = step2 & !is.na(share_female),
+         step4 = step3 & !is.na(share_part_occ),
+         step5 = step4 & !is.na(gdp),
+         step6 = step5 & !is.na(trade_openness),
+         step7 = step6 & !is.na(social_inequality))
+
+step_labels <- c(step0 = "0. All countries and years",
+                 step1 = "1. Employment reported (> 0)",
+                 step2 = "2. Production reported (> 0)",
+                 step3 = "3. Share of female workers available",
+                 step4 = "4. Share of part-time/occasional workers available",
+                 step5 = "5. GDP per capita available (restricted models)",
+                 step6 = "6. Trade openness available",
+                 step7 = "7. Gini index available (extended models)")
+
+sample_flow <- cells %>%
+  pivot_longer(step0:step7, names_to = "step", values_to = "kept") %>%
+  filter(kept) %>%
+  group_by(step, oc2) %>%
+  summarise(value = paste0(n(), " (", n_distinct(un_code), ")")) %>%
+  ungroup() %>%
+  pivot_wider(names_from = oc2, values_from = value) %>%
+  mutate(step = step_labels[step])
+
+sample_flow
+
+write_csv(sample_flow, "./outputs/tables/tableS2A.csv")
+
+# Check: the last steps match the number of observations of the models
+cells %>%
+  group_by(Sector = oc2) %>%
+  summarise(`Step 5` = sum(step5), `Step 7` = sum(step7)) %>%
+  mutate(`Restricted models` = c(nobs(faqua), nobs(rinfishing), nobs(rmarfishing)),
+         `Extended models` = c(nobs(faqua_ext), nobs(finfishing_ext), nobs(fmarfishing_ext)))
+
+```
+
+### Included vs excluded country-years
+
+For all country-years with employment reported (step 1), the tables give the share included in the restricted and extended models, by income group and by region. The income groups are the World Bank classification provided in the FAO dataset (one group per country).
+
+```{r coverage}
+
+coverage_income <- cells %>%
+  filter(step1) %>%
+  group_by(Sector = oc2, `Income group` = income_group_wb) %>%
+  summarise(`Country-years with employment` = n(),
+            `% in restricted models` = round(100 * mean(step5), 1),
+            `% in extended models` = round(100 * mean(step7), 1)) %>%
+  ungroup()
+
+coverage_region <- cells %>%
+  filter(step1) %>%
+  group_by(Sector = oc2, Region = continent_mod) %>%
+  summarise(`Country-years with employment` = n(),
+            `% in restricted models` = round(100 * mean(step5), 1),
+            `% in extended models` = round(100 * mean(step7), 1)) %>%
+  ungroup()
+
+coverage_income
+coverage_region
+
+write_csv(coverage_income, "./outputs/tables/tableS2B.csv")
+write_csv(coverage_region, "./outputs/tables/tableS2C.csv")
+
+```
+
+### Availability matrix
+
+For the Supplement, the availability of each country, sector and year is saved as a figure (`figS6.pdf`, Figure S6 of the Supplement). This is not displayed here because of the size of the matrix.
+
+```{r availability-matrix}
+
+availability <- cells %>%
+  mutate(status = case_when(
+    step7 ~ "Extended models",
+    step5 ~ "Restricted models",
+    step2 ~ "Productivity available, other variable missing",
+    step1 ~ "Employment only",
+    TRUE ~ "No employment reported"),
+    status = factor(status, levels = c("No employment reported", "Employment only",
+                                       "Productivity available, other variable missing",
+                                       "Restricted models", "Extended models")))
+
+p <- availability %>%
+  ggplot(aes(x = year, y = factor(geographic_area, levels = rev(sort(unique(geographic_area)))), fill = status)) +
+    geom_tile() +
+    facet_grid(continent_mod ~ oc2, scales = "free_y", space = "free_y") +
+    scale_fill_manual(values = c("grey95", "grey75", "#C6DBEF", "#6BAED6", "#08519C")) +
+    labs(x = "", y = "") +
+    theme(axis.text.y = element_text(size = 3.5),
+          strip.text.y = element_text(angle = 0),
+          panel.grid = element_blank())
+
+ggsave("./outputs/figures/figS6.pdf",
+       plot = p + theme_journal() + theme(axis.text.y = element_text(size = 3.5), strip.text.y = element_text(angle = 0), panel.grid = element_blank()),
+       width = 21, height = 59.4, units = "cm")
+
+```
+
+## Coverage by year
+
+Number of countries with employment reported, with productivity available, and in the samples of the restricted and extended models, by year and sector. The full table is saved in `tableS1C.csv` (Table S1 C of the Supplement).
+
+```{r coverage-by-year}
+
+coverage_year <- cells %>%
+  group_by(year, oc2) %>%
+  summarise(Employment = sum(step1),
+            Productivity = sum(step2),
+            Restricted = sum(step5),
+            Extended = sum(step7)) %>%
+  ungroup() %>%
+  pivot_wider(names_from = oc2, values_from = c(Employment, Productivity, Restricted, Extended),
+              names_glue = "{oc2}: {.value}") %>%
+  select(Year = year, starts_with("Aquaculture"), starts_with("Inland"), starts_with("Marine"))
+
+coverage_year
+
+write_csv(coverage_year, "./outputs/tables/tableS1C.csv")
+
+```
+
+## Matching production and employment records
+
+Production and employment records are matched on country (UN M49 code), sector and year (chunks `emp`, `prod` and `join-productivity`). Both datasets are first aggregated to the same three sectors:
+
+- **employment**: work areas A (aquaculture), I (inland fishing), and C, D and M (marine fishing). Employment with an unspecified work area (U) cannot be matched to production and is left out (see "Unspecified-sector employment" above);
+- **production**: freshwater, brackish-water and marine aquaculture form aquaculture; capture production is split into inland and marine fishing according to the FAO fishing area (inland waters or marine areas). Quantities reported in number of animals are excluded. Aquatic plants are included.
+
+The match starts from employment: each country-sector-year with employment receives the production of the same country, sector and year. If there is no production record, productivity is missing. Production records without employment are not used. The tables below show how many records match on each side.
+
+```{r matching}
+
+# Employment side: country-years with employment, and how many have a production record
+emp_data_join %>%
+  filter(value_emp > 0) %>%
+  left_join(prod_data_join, by = "conc_prod") %>%
+  group_by(Sector = oc2) %>%
+  summarise(`Country-years with employment` = n(),
+            `With a production record` = sum(!is.na(value_prod)),
+            `With production > 0` = sum(value_prod > 0, na.rm = TRUE))
+
+# Production side: country-years with production, and the share of tonnage without matching employment
+employment_keys <- emp_data_join %>% filter(value_emp > 0) %>% pull(conc_prod)
+
+prod_data %>%
+  filter(oc2 %in% sectors, year <= max(emp_data$year)) %>%
+  unite("conc_prod", c("un_code", "oc2", "year"), sep = "|", remove = FALSE) %>%
+  mutate(matched = conc_prod %in% employment_keys) %>%
+  group_by(Sector = oc2) %>%
+  summarise(`Country-years with production` = n(),
+            `Without employment` = sum(!matched),
+            `% of tonnage without employment` = round(100 * sum(value[!matched]) / sum(value), 1))
+
+```
+
+## Harmonisation over 1995–2023
+
+- **Countries.** Countries are identified by their UN M49 code, as in the FAO datasets, and the World Bank data are joined through FAO's ISO3–M49 correspondence table (chunk `iso-to-un`). Countries are not merged or split to follow border changes: a country that ceased to exist and its successors are separate countries (for example Sudan [former] until 2011 and Sudan from 2012). Former countries have no ISO3 code, so they receive no World Bank data and drop out of the models.
+- **Income groups.** Income groups are the World Bank classification provided in FAO's country groupings: **one group per country, fixed over the whole period**. They do not follow the year-by-year World Bank classification. They are used only in descriptive figures and tables; the models use GDP per capita, which changes every year. The check below confirms that each country has a single income group.
+- **Sectors.** The sector definitions above are applied in the same way to all years.
+- **National revisions.** Each dataset comes from a single release (FAO employment and production: release 2026.1.0; World Bank: see "Data sources"). Each FAO release contains the complete time series as revised up to that release, so all years come from the same version of the data. We do not adjust the series further: breaks in series (flag B) and FAO estimates (flag I) are used as published. The table below counts the model observations that include an employment record flagged as a break in series.
+
+```{r harmonisation}
+
+# Each country has a single income group over the whole period
+emp_data %>%
+  distinct(un_code, income_group_wb) %>%
+  count(un_code) %>%
+  summarise(`Countries` = n(), `Countries with more than one income group` = sum(n > 1))
+
+# Observations of the restricted models that include an employment record flagged as a break in series (B)
+break_in_series <- emp_data %>%
+  filter(flag == "B", oc2 %in% sectors) %>%
+  distinct(un_code, oc2, year) %>%
+  mutate(break_flag = TRUE)
+
+cells %>%
+  filter(step5) %>%
+  left_join(break_in_series, by = c("un_code", "oc2", "year")) %>%
+  group_by(Sector = oc2) %>%
+  summarise(`Restricted-model observations` = n(),
+            `With a break in series (flag B)` = sum(!is.na(break_flag)))
+
+```
+
+## Rules for missing data, zeros, logs, outliers and weighting
+
+| Situation | Rule | Where |
+|---|---|---|
+| Missing values | No imputation. Each model uses the country-years with all its variables available (sample flow above). Each correlation uses the country-years with both variables available. | Models; `corr-*` chunks |
+| Zero employment | Country-year removed (productivity undefined). | `join-productivity` |
+| Zero production | Productivity missing: excluded from all productivity analyses (correlations, box plots, aggregate charts and models). Kept in the female-share analyses. | `join-productivity` |
+| No production record | Productivity missing: excluded from correlations, models and aggregate productivity charts. | `join-productivity`, `productivities-*-line` |
+| Unspecified sex | Left out of the female share. No female record = zero women. All workers of unspecified sex: share missing. | `emp_share_female` |
+| Unspecified working time | Left out of the part-time share. All workers unspecified: share missing. | `share-part-occ` |
+| Unspecified sector | Left out of the three sectors (cannot be matched to production). | `emp` |
+| Log transformations | Log of productivity in all models; GDP per capita in levels (thousand dollars), log as a sensitivity check. | `reg-data-prep`, "Functional form" above |
+| Outliers | Identified with the 1.5 × IQR rule (productivity by sector, GDP per capita), but only used to colour or hide points in the scatterplots. **No observation is removed** from any estimate. | `productivity-outliers`, `gdp-outliers` |
+| Weighting | Models and correlations: **unweighted**, each country-sector-year counts once, pooled over 1995–2023. Box plots and their means: unweighted country values. Aggregate productivity charts (total tonnes / total workers) and the female share by region and sector (Fig. 4): **weighted** by employment. Mean female share by continent (line chart): unweighted mean of country shares. | Models; figure chunks |
+
+# Reproducibility
+
+## R session information
+
+```{r session-info}
+
+sessionInfo(package = NULL)
+
+```
