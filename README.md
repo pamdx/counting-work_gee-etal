@@ -4,7 +4,7 @@ Code and data supporting the paper:
 
 > **Counting work in global fisheries: sex-disaggregated employment, labour productivity and data gaps across aquatic food sectors**
 >
-> Jennifer L. M. Gee, Konstantinos Polymeros, Thorolfur Matthiasson, Dario Pinello, Pierre-Ami Maudoux
+> Jennifer L. M. Gee, Dario Pinello, Pierre-Ami Maudoux, Thorolfur Matthiasson, Konstantinos Polymeros
 >
 > Preprint (11/07/2026): <https://papers.ssrn.com/sol3/11/07/2026p11/07/2026apers.cfm?abstract_id=7100469>
 
@@ -28,4 +28,8 @@ Required packages: `readr`, `janitor`, `dplyr`, `tidyr`, `stringr`, `ggplot2`, `
 
 - FAO (2026). *Employment in the primary sector of fisheries and aquaculture*, release 2026.1.0.
 - FAO (2026). *Global production (FishStat)*, release 2026.1.0.
-- World Bank. *World Development Indicators*: NY.GDP.PCAP.PP.KD, NY.GNP.PCAP.PP.KD, NE.TRD.GNFS.ZS, SI.POV.GINI.
+- World Bank. *World Development Indicators*, WDI update of 11 Nov 2026: 
+	- GDP per capita, PPP (constant 2021 international $) [NY.GDP.PCAP.PP.KD]
+	- GNI per capita, PPP (constant 2021 international $) [NY.GNP.PCAP.PP.KD]
+	- Trade (% of GDP) [NE.TRD.GNFS.ZS]
+	- Gini index [SI.POV.GINI]
