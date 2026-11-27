@@ -6,7 +6,7 @@ Code and data supporting the paper:
 >
 > Jennifer L. M. Gee, Dario Pinello, Pierre-Ami Maudoux, Thorolfur Matthiasson, Konstantinos Polymeros
 >
-> Preprint (11/07/2026): <https://papers.ssrn.com/sol3/11/07/2026p11/07/2026apers.cfm?abstract_id=7100469>
+> SSRN preprint (11/07/2026): <https://doi.org/10.2139/ssrn.7100469>
 
 The analysis combines FAO employment and production data (1995–2023) with World Bank indicators. It describes employment by sector, sex and working time, compares output per worker across countries, and estimates panel models of output per worker in aquaculture, inland fishing and marine fishing.
 

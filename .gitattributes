@@ -1,0 +1,6 @@
+# Count .Rmd files as R code (or use "R Markdown" if preferred)
+*.Rmd linguist-detectable=true
+*.Rmd linguist-language=R
+
+# Ignore generated .tex files in language stats
+*.tex linguist-vendored
